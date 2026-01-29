@@ -5,8 +5,12 @@ import os
 import sys
 import time
 import torch
+from dataclasses import dataclass, field
+from typing import Optional
 from tqdm import tqdm
-from transformers import HfArgumentParser
+from transformers import HfArgumentParser, AutoTokenizer, AutoModelForCausalLM
+from accelerate import Accelerator
+from peft import LoraConfig, get_peft_model
 import wandb
 from statistics import mean, stdev
 
@@ -18,16 +22,171 @@ if scripts_dir not in sys.path:
 from grpo_trainer import GRPOTrainer
 from grpo_config import GRPOConfig
 
-from rlhfutils.rl_utils import (
-    GRPOScriptArguments,
-    load_models_grpo,
-)
-
 from rlhfutils.data import (
     build_toxicity_promptdata,
     collator,
     anscat,
 )
+
+# ============================================================================
+# GRPOScriptArguments - Defined locally to avoid import issues
+# ============================================================================
+@dataclass
+class GRPOScriptArguments:
+    """
+    Script arguments for GRPO (Group Relative Policy Optimization) training.
+    """
+    
+    min_length: Optional[int] = field(default=20, metadata={"help": "minimum length for generation"})
+    model_name: Optional[str] = field(default="facebook/opt-125m", metadata={"help": "the model name"})
+    adapter_model_name: Optional[str] = field(default=None, metadata={"help": "the adapter model name"})
+    reward_model_name: Optional[str] = field(default="function:bagofwords", metadata={"help": "the reward model name"})
+    tokenizer_name: Optional[str] = field(default=None, metadata={"help": "the tokenizer name"})
+    dataset_name: Optional[str] = field(default="ultra", metadata={"help": "the dataset name"})
+    dataset_path: Optional[str] = field(default=None, metadata={"help": "the dataset path"})
+    val_data_path: Optional[str] = field(default='toxicity.csv', metadata={"help": "the validation dataset path"})
+    log_with: Optional[str] = field(default=None, metadata={"help": "use 'wandb' to log with wandb"})
+    kl_penalty: Optional[str] = field(default="kl", metadata={"help": "kl penalty setup"})
+    learning_rate: Optional[float] = field(default=1.41e-5, metadata={"help": "the learning rate"})
+    max_length: Optional[int] = field(default=256, metadata={"help": "maximum length for generation"})
+    mini_batch_size: Optional[int] = field(default=1, metadata={"help": "the GRPO minibatch size"})
+    tracin_batch_size: Optional[int] = field(default=4, metadata={"help": "Number of samples used for TRACIN"})
+    tracin_val_batch_size: Optional[int] = field(default=4, metadata={"help": "Number of samples used for TRACIN validation"})
+    batch_size: Optional[int] = field(default=32, metadata={"help": "the batch size"})
+    val_size: Optional[int] = field(default=2048, metadata={"help": "the validation size"})
+    
+    # GRPO-specific: number of generations per prompt
+    num_generations: Optional[int] = field(default=4, metadata={"help": "number of generations per prompt for group-relative advantages"})
+    grpo_epochs: Optional[int] = field(default=4, metadata={"help": "the number of GRPO epochs"})
+    
+    gradient_accumulation_steps: Optional[int] = field(default=1, metadata={"help": "the number of gradient accumulation steps"})
+    adafactor: Optional[bool] = field(default=False, metadata={"help": "whether to use the adafactor optimizer"})
+    early_stopping: Optional[bool] = field(default=False, metadata={"help": "whether to early stop"})
+    save_rollouts: Optional[bool] = field(default=False, metadata={"help": "save rollouts, rewards to file"})
+    target_kl: Optional[float] = field(default=0.1, metadata={"help": "kl target for early stopping"})
+    tracin: Optional[bool] = field(default=False, metadata={"help": "whether to use tracin for reselection"})
+    load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "whether to load in 8 bit"})
+    with_validation: Optional[bool] = field(default=False, metadata={"help": "whether to use validation"})
+    reward_source: Optional[str] = field(default="rm", metadata={"help": "the reward source"})
+    val_loss_type: Optional[str] = field(default='rough-orig', metadata={"help": "the validation loss type"})
+    reward_baseline: Optional[float] = field(default=0, metadata={"help": "a baseline value that is subtracted from the reward"})
+    omit_long: Optional[float] = field(default=0, metadata={"help": "whether to omit outputs that don't fit in length context or not"})
+    len_penalty: Optional[float] = field(default=0, metadata={"help": "length penalty"})
+    scale_reward: Optional[float] = field(default=0, metadata={"help": "scale reward"})
+    save_freq: Optional[int] = field(default=None, metadata={"help": "n steps to save the model"})
+    output_dir: Optional[str] = field(default="checkpoints/debugging", metadata={"help": "directory to save the model"})
+    seed: Optional[int] = field(default=1, metadata={"help": "the seed"})
+    steps: Optional[int] = field(default=10000, metadata={"help": "number of steps"})
+    init_kl_coef: Optional[float] = field(default=0.2, metadata={"help": "Initial KL penalty coefficient"})
+    gen_bsize: Optional[int] = field(default=1, metadata={"help": "generation batch size"})
+    temperature: Optional[float] = field(default=1.0, metadata={"help": "sampling temperature for generation"})
+    wandb_project: Optional[str] = field(default="llamatrl", metadata={"help": "wandb project name"})
+    run_name: Optional[str] = field(default="llamatrl", metadata={"help": "wandb run name"})
+    gen_data_dir: Optional[str] = field(default=None, metadata={"help": "directory to save generated data"})
+    val_strategy: Optional[str] = field(default="random", metadata={"help": "validation strategy"})
+
+
+# ============================================================================
+# LoRA config and model loading - Defined locally to avoid import issues
+# ============================================================================
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+)
+
+
+def get_reward_pipeline(rmname, device):
+    """Load reward model and tokenizer."""
+    if "hate" in rmname:
+        from transformers import RobertaTokenizer, RobertaForSequenceClassification
+        toxicity_model_id = "facebook/roberta-hate-speech-dynabench-r4-target"
+        toxicity_tokenizer = RobertaTokenizer.from_pretrained(toxicity_model_id)
+        toxicity_model = RobertaForSequenceClassification.from_pretrained(
+            toxicity_model_id,
+        ).to(device)
+        return toxicity_tokenizer, toxicity_model
+    else:
+        raise ValueError(f"Reward model {rmname} not supported for GRPO toxicity training")
+
+
+def load_models_grpo(script_args, loadms="rmgrpo"):
+    """
+    Load models for GRPO training.
+    Unlike PPO, GRPO uses AutoModelForCausalLM (no value head).
+    """
+    current_device = Accelerator().local_process_index
+
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(script_args.model_name)
+    if getattr(tokenizer, "pad_token", None) is None:
+        print("resetting pad token?")
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if "grpo" in loadms:
+        config = GRPOConfig(
+            model_name=script_args.model_name,
+            learning_rate=script_args.learning_rate,
+            log_with="wandb",
+            batch_size=script_args.batch_size,
+            val_size=script_args.val_size,
+            mini_batch_size=script_args.mini_batch_size,
+            tracin_batch_size=script_args.tracin_batch_size,
+            tracin_val_batch_size=script_args.tracin_val_batch_size,
+            gradient_accumulation_steps=script_args.gradient_accumulation_steps,
+            early_stopping=script_args.early_stopping,
+            target_kl=script_args.target_kl,
+            grpo_epochs=script_args.grpo_epochs,
+            num_generations=script_args.num_generations,
+            seed=script_args.seed,
+            cliprange=0.2,
+            horizon=10000,
+            target=script_args.target_kl,
+            init_kl_coef=script_args.init_kl_coef,
+            steps=script_args.steps,
+            kl_penalty=script_args.kl_penalty,
+            remove_unused_columns=False,
+            val_loss_type=script_args.val_loss_type,
+            temperature=script_args.temperature,
+        )
+        
+        # Load model WITHOUT value head (key difference from PPO)
+        model = AutoModelForCausalLM.from_pretrained(
+            script_args.model_name,
+            load_in_8bit=True if script_args.load_in_8bit else False,
+            device_map={"": current_device},
+            torch_dtype=torch.bfloat16,
+        )
+        
+        # Apply LoRA
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+
+        optimizer = None
+        if script_args.adafactor:
+            from transformers import Adafactor
+            optimizer = Adafactor(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                scale_parameter=False,
+                relative_step=False,
+                warmup_init=False,
+                lr=config.learning_rate,
+            )
+
+    if "rm" in loadms:
+        ptok, reward_model = get_reward_pipeline(script_args.reward_model_name, current_device)
+    if loadms == "rm":
+        return ptok, reward_model
+    
+    model.gradient_checkpointing_disable()
+    
+    # GRPO model only
+    if loadms == "grpo":
+        return config, tokenizer, model, optimizer
+    # GRPO with reward model
+    return config, tokenizer, model, optimizer, reward_model, ptok
 
 os.environ["WANDB_TAGS"] = "[\"llamatrl\", \"grpo\"]"
 tqdm.pandas()
