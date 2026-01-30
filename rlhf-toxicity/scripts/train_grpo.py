@@ -286,24 +286,26 @@ def grpo_train_loop(
             print(queries_text[:2] if len(queries_text) >= 2 else queries_text)
             print("=" * 30)
         
-        # Generate multiple responses per query
+        # Generate multiple responses per query using BATCHED generation
         t = time.time()
-        all_responses = []
         all_queries = []
         
+        # Expand queries: repeat each query num_generations times
+        expanded_queries = []
+        for q_tensor in question_tensors:
+            for _ in range(script_args.num_generations):
+                expanded_queries.append(q_tensor.to(device))
+                all_queries.append(q_tensor)
+        
+        # Batched generation - process all at once (much faster!)
         with torch.no_grad():
-            for q_tensor in question_tensors:
-                for _ in range(script_args.num_generations):
-                    response = grpo_trainer.generate(
-                        q_tensor.to(device),
-                        return_prompt=False,
-                        **generation_kwargs
-                    )
-                    if isinstance(response, torch.Tensor):
-                        all_responses.append(response.squeeze(0))
-                    else:
-                        all_responses.append(response[0])
-                    all_queries.append(q_tensor)
+            gen_batch_size = script_args.gen_bsize if hasattr(script_args, 'gen_bsize') else 32
+            all_responses = grpo_trainer.generate(
+                expanded_queries,
+                batch_size=gen_batch_size,
+                return_prompt=False,
+                **generation_kwargs
+            )
         
         timing["time/grpo/generation"] = time.time() - t
         
@@ -417,24 +419,26 @@ def grpo_train_loop_with_validation(
         question_tensors = batch["input_ids"]
         queries_text = batch.get("query", tokenizer.batch_decode(question_tensors, skip_special_tokens=True))
         
-        # Generate multiple responses per query
+        # Generate multiple responses per query using BATCHED generation
         t = time.time()
-        all_responses = []
         all_queries = []
         
+        # Expand queries: repeat each query num_generations times
+        expanded_queries = []
+        for q_tensor in question_tensors:
+            for _ in range(script_args.num_generations):
+                expanded_queries.append(q_tensor.to(device))
+                all_queries.append(q_tensor)
+        
+        # Batched generation - process all at once (much faster!)
         with torch.no_grad():
-            for q_tensor in question_tensors:
-                for _ in range(script_args.num_generations):
-                    response = grpo_trainer.generate(
-                        q_tensor.to(device),
-                        return_prompt=False,
-                        **generation_kwargs
-                    )
-                    if isinstance(response, torch.Tensor):
-                        all_responses.append(response.squeeze(0))
-                    else:
-                        all_responses.append(response[0])
-                    all_queries.append(q_tensor)
+            gen_batch_size = script_args.gen_bsize if hasattr(script_args, 'gen_bsize') else 32
+            all_responses = grpo_trainer.generate(
+                expanded_queries,
+                batch_size=gen_batch_size,
+                return_prompt=False,
+                **generation_kwargs
+            )
         
         timing["time/grpo/generation"] = time.time() - t
         
@@ -457,19 +461,15 @@ def grpo_train_loop_with_validation(
             val_sample_size = min(16, len(val_question_tensors))
             val_sample_indices = torch.randperm(len(val_question_tensors))[:val_sample_size]
             
-            val_responses = []
+            # Batched validation generation
+            val_queries_batch = [val_question_tensors[idx].to(device) for idx in val_sample_indices]
             with torch.no_grad():
-                for idx in val_sample_indices:
-                    q_tensor = val_question_tensors[idx]
-                    response = grpo_trainer.generate(
-                        q_tensor.to(device),
-                        return_prompt=False,
-                        **generation_kwargs
-                    )
-                    if isinstance(response, torch.Tensor):
-                        val_responses.append(response.squeeze(0))
-                    else:
-                        val_responses.append(response[0])
+                val_responses = grpo_trainer.generate(
+                    val_queries_batch,
+                    batch_size=val_sample_size,
+                    return_prompt=False,
+                    **generation_kwargs
+                )
             
             val_response_texts = tokenizer.batch_decode(val_responses, skip_special_tokens=True)
             val_query_texts = [val_questions[idx] for idx in val_sample_indices]
