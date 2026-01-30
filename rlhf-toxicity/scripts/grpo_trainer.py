@@ -542,6 +542,52 @@ class GRPOTrainer:
         
         return torch.stack(padded_logprobs), torch.stack(padded_masks)
 
+    def _extract_response_logits(self, logits, queries, responses):
+        """
+        Extract only the response portion of logits for entropy computation.
+        
+        Args:
+            logits: Full sequence logits [batch, full_seq_len, vocab_size]
+            queries: List of query tensors
+            responses: List of response tensors
+            
+        Returns:
+            response_logits: Padded response logits [batch, max_response_len, vocab_size]
+        """
+        all_response_logits = []
+        
+        for i, (query, response) in enumerate(zip(queries, responses)):
+            query_len = len(query)
+            response_len = len(response)
+            
+            # Extract response portion of logits (aligned with response tokens)
+            # We use query_len-1 to query_len+response_len-1 because of autoregressive shift
+            response_start = query_len - 1
+            response_end = query_len + response_len - 1
+            
+            # Handle edge case where response_start might be negative
+            if response_start < 0:
+                response_start = 0
+            if response_end > logits.shape[1]:
+                response_end = logits.shape[1]
+            
+            response_logits = logits[i, response_start:response_end]
+            all_response_logits.append(response_logits)
+        
+        # Pad to same length
+        max_len = max(rl.shape[0] for rl in all_response_logits)
+        vocab_size = logits.shape[-1]
+        
+        padded_response_logits = []
+        for rl in all_response_logits:
+            pad_len = max_len - rl.shape[0]
+            if pad_len > 0:
+                padding = torch.zeros(pad_len, vocab_size, device=rl.device, dtype=rl.dtype)
+                rl = torch.cat([rl, padding], dim=0)
+            padded_response_logits.append(rl)
+        
+        return torch.stack(padded_response_logits)
+
     def compute_rewards_with_kl(self, scores, logprobs, ref_logprobs, masks):
         """
         Compute rewards with KL penalty.
@@ -676,10 +722,13 @@ class GRPOTrainer:
                 # Compute new log probs
                 mb_logprobs_new, _ = self.compute_logprobs(self.model, mb_queries, mb_responses, mb_model_inputs)
                 
+                # Extract response-only logits for entropy computation
+                response_logits = self._extract_response_logits(logits, mb_queries, mb_responses)
+                
                 # Compute loss
                 pg_loss, stats = self.loss(
                     mb_logprobs_old,
-                    logits,
+                    response_logits,
                     mb_logprobs_new,
                     mb_masks,
                     mb_advantages,
