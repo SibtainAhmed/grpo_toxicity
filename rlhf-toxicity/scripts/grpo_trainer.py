@@ -588,6 +588,86 @@ class GRPOTrainer:
         
         return torch.stack(padded_response_logits)
 
+    def _extract_response_logits_consistent(self, logits, queries, responses, target_len):
+        """
+        Extract response logits with consistent padding to target_len.
+        """
+        all_response_logits = []
+        vocab_size = logits.shape[-1]
+        
+        for i, (query, response) in enumerate(zip(queries, responses)):
+            query_len = len(query)
+            response_len = len(response)
+            
+            response_start = query_len - 1
+            response_end = query_len + response_len - 1
+            
+            if response_start < 0:
+                response_start = 0
+            if response_end > logits.shape[1]:
+                response_end = logits.shape[1]
+            
+            response_logits = logits[i, response_start:response_end]
+            
+            # Pad to target_len
+            pad_len = target_len - response_logits.shape[0]
+            if pad_len > 0:
+                padding = torch.zeros(pad_len, vocab_size, device=response_logits.device, dtype=response_logits.dtype)
+                response_logits = torch.cat([response_logits, padding], dim=0)
+            elif pad_len < 0:
+                # Truncate if longer
+                response_logits = response_logits[:target_len]
+            
+            all_response_logits.append(response_logits)
+        
+        return torch.stack(all_response_logits)
+
+    def _compute_logprobs_consistent(self, logits, queries, responses, model_inputs, target_len):
+        """
+        Compute log probabilities with consistent padding to target_len.
+        """
+        input_ids = model_inputs["input_ids"]
+        all_logprobs = []
+        
+        for i, (query, response) in enumerate(zip(queries, responses)):
+            query_len = len(query)
+            response_len = len(response)
+            
+            # Get logits for this sequence
+            seq_logits = logits[i]
+            
+            # Compute log probs
+            log_probs = F.log_softmax(seq_logits, dim=-1)
+            
+            # Get response token log probs (shift by 1 for autoregressive)
+            response_start = query_len
+            response_end = query_len + response_len
+            
+            # Ensure we don't go out of bounds
+            if response_end > input_ids.shape[1]:
+                response_end = input_ids.shape[1]
+            if response_start >= response_end:
+                # Edge case: empty response
+                response_logprobs = torch.zeros(target_len, device=logits.device, dtype=logits.dtype)
+            else:
+                # Get log probs of actual tokens
+                response_logprobs = torch.gather(
+                    log_probs[response_start-1:response_end-1],
+                    dim=-1,
+                    index=input_ids[i, response_start:response_end].unsqueeze(-1)
+                ).squeeze(-1)
+                
+                # Pad to target_len
+                pad_len = target_len - response_logprobs.shape[0]
+                if pad_len > 0:
+                    response_logprobs = F.pad(response_logprobs, (0, pad_len), value=0)
+                elif pad_len < 0:
+                    response_logprobs = response_logprobs[:target_len]
+            
+            all_logprobs.append(response_logprobs)
+        
+        return torch.stack(all_logprobs)
+
     def compute_rewards_with_kl(self, scores, logprobs, ref_logprobs, masks):
         """
         Compute rewards with KL penalty.
@@ -694,6 +774,10 @@ class GRPOTrainer:
         all_stats = []
         self.model.train()
         
+        # Store response lengths for consistent indexing
+        response_lengths = [len(r) for r in responses]
+        max_response_len = logprobs.shape[1]  # Use cached logprobs padding length
+        
         for epoch in range(self.config.grpo_epochs):
             # Shuffle indices for mini-batching
             indices = torch.randperm(bs)
@@ -702,15 +786,18 @@ class GRPOTrainer:
                 end_idx = min(start_idx + self.config.mini_batch_size, bs)
                 batch_indices = indices[start_idx:end_idx]
                 
-                # Get mini-batch data
+                # Get mini-batch data (use cached tensors with consistent padding)
                 mb_logprobs_old = logprobs[batch_indices].detach()
                 mb_advantages = advantages_expanded[batch_indices].detach()
                 mb_masks = masks[batch_indices]
                 mb_queries = [queries[i] for i in batch_indices]
                 mb_responses = [responses[i] for i in batch_indices]
                 
-                # Prepare inputs for this mini-batch
-                mb_model_inputs = self.prepare_model_inputs(mb_queries, mb_responses)
+                # Use the ORIGINAL model_inputs with batch indexing for consistent sequence lengths
+                mb_model_inputs = {
+                    "input_ids": model_inputs["input_ids"][batch_indices],
+                    "attention_mask": model_inputs["attention_mask"][batch_indices],
+                }
                 
                 # Forward pass
                 outputs = self.model(
@@ -719,11 +806,15 @@ class GRPOTrainer:
                 )
                 logits = outputs.logits
                 
-                # Compute new log probs
-                mb_logprobs_new, _ = self.compute_logprobs(self.model, mb_queries, mb_responses, mb_model_inputs)
+                # Compute new log probs with consistent padding
+                mb_logprobs_new = self._compute_logprobs_consistent(
+                    logits, mb_queries, mb_responses, mb_model_inputs, max_response_len
+                )
                 
-                # Extract response-only logits for entropy computation
-                response_logits = self._extract_response_logits(logits, mb_queries, mb_responses)
+                # Extract response-only logits for entropy computation (with consistent padding)
+                response_logits = self._extract_response_logits_consistent(
+                    logits, mb_queries, mb_responses, max_response_len
+                )
                 
                 # Compute loss
                 pg_loss, stats = self.loss(
