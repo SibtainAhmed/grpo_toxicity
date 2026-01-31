@@ -434,7 +434,7 @@ class GRPOTrainer:
         
         return all_responses, expanded_queries
 
-    def compute_group_advantages(self, rewards: torch.Tensor, num_generations: int):
+    def compute_group_advantages(self, rewards: torch.Tensor, num_generations: int, normalize_batch: bool = True):
         """
         Compute group-relative advantages.
         
@@ -444,6 +444,7 @@ class GRPOTrainer:
         Args:
             rewards: Tensor of shape [batch_size * num_generations]
             num_generations: Number of generations per prompt
+            normalize_batch: Whether to normalize advantages across entire batch (reduces variance)
             
         Returns:
             advantages: Tensor of shape [batch_size * num_generations]
@@ -453,13 +454,23 @@ class GRPOTrainer:
         
         # Compute mean and std per group
         mean = rewards_grouped.mean(dim=1, keepdim=True)
-        std = rewards_grouped.std(dim=1, keepdim=True) + 1e-8
+        std = rewards_grouped.std(dim=1, keepdim=True)
+        
+        # Use larger epsilon and clamp std to avoid division issues with small groups
+        std = torch.clamp(std, min=0.1)  # Minimum std of 0.1 for stability
         
         # Normalize within each group
         advantages = (rewards_grouped - mean) / std
         
         # Flatten back
-        return advantages.view(-1)
+        advantages = advantages.view(-1)
+        
+        # IMPORTANT: Normalize advantages across entire batch (like PPO does)
+        # This significantly reduces variance and stabilizes training
+        if normalize_batch:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        return advantages
 
     def prepare_model_inputs(self, queries, responses):
         """Prepare model inputs from queries and responses."""
@@ -738,19 +749,27 @@ class GRPOTrainer:
         # Convert scores to tensor
         scores_tensor = torch.tensor(scores, device=self.current_device, dtype=torch.float32)
         
-        # Compute rewards with KL penalty
+        # Compute rewards with KL penalty (for loss computation)
         t = time.time()
         rewards, non_score_reward = self.compute_rewards_with_kl(scores_tensor, logprobs, ref_logprobs, masks)
         timing["time/grpo/compute_rewards"] = time.time() - t
         
         # Compute group-relative advantages
         t = time.time()
-        # Sum rewards across sequence for each sample
-        total_rewards = (rewards * masks).sum(dim=-1)
-        advantages = self.compute_group_advantages(total_rewards, self.config.num_generations)
+        # IMPORTANT: Use RAW SCORES for advantage computation, not KL-penalized rewards!
+        # This is the key difference - GRPO computes relative advantages from original reward signals
+        # KL penalty is already applied in the loss through the ratio clipping
+        advantages = self.compute_group_advantages(scores_tensor, self.config.num_generations)
         # Expand advantages to sequence level
         advantages_expanded = advantages.unsqueeze(-1).expand_as(logprobs)
         timing["time/grpo/compute_advantages"] = time.time() - t
+        
+        # Debug logging (every 10 steps)
+        if self.save_cnt % 10 == 0:
+            print(f"\n[GRPO Debug Step {self.save_cnt}]")
+            print(f"  Scores: mean={scores_tensor.mean():.4f}, std={scores_tensor.std():.4f}, min={scores_tensor.min():.4f}, max={scores_tensor.max():.4f}")
+            print(f"  Advantages: mean={advantages.mean():.4f}, std={advantages.std():.4f}")
+            print(f"  KL coef: {self.kl_ctl.value:.4f}")
         
         # Save generated data if requested
         if gen_data_dir is not None:
@@ -876,6 +895,7 @@ class GRPOTrainer:
         logprobs: torch.FloatTensor,
         mask: torch.LongTensor,
         advantages: torch.FloatTensor,
+        entropy_coef: float = 0.01,
     ):
         """
         Calculate GRPO policy loss (no value loss).
@@ -886,6 +906,7 @@ class GRPOTrainer:
             logprobs: Log probabilities from current policy
             mask: Attention mask
             advantages: Group-relative advantages
+            entropy_coef: Coefficient for entropy bonus (encourages exploration)
         """
         # Policy gradient with clipping
         ratio = torch.exp(logprobs - old_logprobs)
@@ -908,8 +929,11 @@ class GRPOTrainer:
             )
             pg_loss = pg_loss * 0.0
         
-        # Entropy bonus
+        # Entropy bonus - encourages exploration and reduces variance
         entropy = masked_mean(entropy_from_logits(logits), mask)
+        
+        # Total loss = policy loss - entropy bonus (we want to maximize entropy)
+        total_loss = pg_loss - entropy_coef * entropy
         
         # Approximate KL
         approxkl = 0.5 * masked_mean((logprobs - old_logprobs) ** 2, mask)
@@ -917,15 +941,18 @@ class GRPOTrainer:
         
         stats = {
             "loss/policy": pg_loss.detach(),
+            "loss/entropy": (-entropy_coef * entropy).detach(),
+            "loss/total": total_loss.detach(),
             "policy/entropy": entropy.detach(),
             "policy/approxkl": approxkl.detach(),
             "policy/policykl": policykl.detach(),
             "policy/clipfrac": pg_clipfrac.detach(),
             "policy/advantages_mean": masked_mean(advantages, mask).detach(),
+            "policy/advantages_std": masked_var(advantages, mask).sqrt().detach(),
             "policy/ratio": avg_ratio,
         }
         
-        return pg_loss, stats
+        return total_loss, stats
 
     def record_step_stats(self, kl_coef: float, **data):
         """Record training step statistics."""
