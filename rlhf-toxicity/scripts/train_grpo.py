@@ -206,6 +206,9 @@ def get_reward_scores(reward_model, reward_tokenizer, texts, device):
     """
     Get reward scores from the toxicity classifier.
     Returns negative toxicity (higher = less toxic = better).
+    
+    IMPORTANT: Uses raw logits (like PPO) not softmax probabilities.
+    This gives the same reward scale as PPO (~2 to ~5 range).
     """
     if reward_model is None:
         return [0.0] * len(texts)
@@ -222,11 +225,11 @@ def get_reward_scores(reward_model, reward_tokenizer, texts, device):
     # Get predictions
     with torch.no_grad():
         outputs = reward_model(**inputs)
-        # For RoBERTa hate speech model, class 0 is "nothate", class 1 is "hate"
-        # We want to reward "nothate" (less toxic), so use negative of hate probability
-        probs = torch.softmax(outputs.logits, dim=-1)
-        # Higher score = less toxic
-        scores = probs[:, 0] - probs[:, 1]  # nothate - hate
+        # Use RAW LOGITS like PPO does (not softmax probabilities!)
+        # logits[:, 0] is the "nothate" logit - higher = less toxic
+        # This gives rewards in range ~2 to ~5, matching PPO scale
+        logits = outputs.logits.float()
+        scores = logits[:, 0]  # "nothate" logit
     
     return scores.cpu().tolist()
 
