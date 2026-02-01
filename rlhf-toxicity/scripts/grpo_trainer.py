@@ -645,6 +645,16 @@ class GRPOTrainer:
         Returns:
             advantages: Tensor of shape [batch_size * num_generations]
         """
+        # SPECIAL CASE: num_generations=1 (e.g., validation set)
+        # Cannot compute group-relative advantages with single sample per group
+        # Instead, normalize across the entire batch
+        if num_generations == 1:
+            mean = rewards.mean()
+            std = torch.clamp(rewards.std(), min=0.1)
+            advantages = (rewards - mean) / std
+            print(f"compute_group_advantages (batch-level): mean={mean:.4f}, std={std:.4f}")
+            return advantages
+        
         # Reshape to [num_prompts, num_generations]
         rewards_grouped = rewards.view(-1, num_generations)
         
@@ -1266,10 +1276,18 @@ class GRPOTrainer:
             print(f'  Fallback validation loss: {validation_loss.item():.4f}')
         
         print(f"Validation loss final: {validation_loss.item():.4f}")
+        print(f"Validation loss requires_grad: {validation_loss.requires_grad}")
+        print(f"Validation loss grad_fn: {validation_loss.grad_fn}")
+        
+        # Debug: Check if val_advantages is all zeros (would cause zero gradients)
+        if (val_advantages == 0).all():
+            print("WARNING: val_advantages is ALL ZEROS - this will cause zero gradients!")
         print(f"================================\n")
         
         # Get model parameters that require gradients
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        num_trainable = len(trainable_params)
+        print(f"Number of trainable parameters: {num_trainable}")
         
         log_gpu_memory("Before validation gradients", verbose=True)
         
@@ -1282,23 +1300,33 @@ class GRPOTrainer:
                 create_graph=False,  # Don't build higher-order graph
                 allow_unused=True,   # Allow unused parameters (e.g., frozen layers)
             )
-            # Filter out None gradients, detach, and MOVE TO CPU to save GPU memory
-            val_grads = [g.detach().cpu() if g is not None else torch.zeros_like(p).cpu() for g, p in zip(val_grads, trainable_params)]
+            
+            # Filter out None gradients, detach, clone, and MOVE TO CPU
+            val_grads = [g.detach().clone().cpu() if g is not None else torch.zeros_like(p).cpu() for g, p in zip(val_grads, trainable_params)]
+            
+            # DEBUG: Check validation gradient norms
+            non_zero_grads = [(i, g.norm().item()) for i, g in enumerate(val_grads) if g.norm().item() > 0]
+            print(f"Validation gradients: {len(non_zero_grads)} non-zero out of {len(val_grads)}")
+            if non_zero_grads:
+                print(f"  First 5 non-zero grad norms: {[norm for _, norm in non_zero_grads[:5]]}")
+            else:
+                print("  WARNING: ALL validation gradients are ZERO!")
             
             # Check for NaN in validation gradients
             val_grad_has_nan = any(torch.isnan(g).any() for g in val_grads)
             if val_grad_has_nan:
                 print("WARNING: Validation gradients contain NaN!")
-                # Zero out NaN gradients
                 val_grads = [torch.where(torch.isnan(g), torch.zeros_like(g), g) for g in val_grads]
         except RuntimeError as e:
             print(f"ERROR computing validation gradients: {e}")
-            # Fallback: zero gradients on CPU
             val_grads = [torch.zeros_like(p).cpu() for p in trainable_params]
         
-        # Free validation intermediate tensors
+        # Free validation intermediate tensors AGGRESSIVELY
         del val_outputs, val_logits, val_logprobs_new, validation_loss
         del val_model_inputs
+        
+        import gc
+        gc.collect()
         torch.cuda.empty_cache()
         
         log_gpu_memory("After validation gradients (moved to CPU)", verbose=True)
@@ -1384,11 +1412,18 @@ class GRPOTrainer:
                 )
                 
                 # Flatten and compute inner product IMMEDIATELY on CPU
-                # Move to CPU for inner product to match val_grad_flat
                 train_grad_flat = torch.cat([
-                    (g.detach().cpu() if g is not None else torch.zeros_like(p).cpu()).flatten()
+                    (g.detach().clone().cpu() if g is not None else torch.zeros_like(p).cpu()).flatten()
                     for g, p in zip(batch_grads, trainable_params)
                 ])
+                
+                # DEBUG: First batch - check training gradient norms
+                if batch_idx == 0:
+                    train_grad_norm = train_grad_flat.norm().item()
+                    val_grad_norm = val_grad_flat.norm().item()
+                    print(f"DEBUG: Train grad norm: {train_grad_norm:.6f}, Val grad norm: {val_grad_norm:.6f}")
+                    non_zero_train = (train_grad_flat != 0).sum().item()
+                    print(f"DEBUG: Train non-zero elements: {non_zero_train} / {train_grad_flat.numel()}")
                 
                 # Check for NaN
                 if torch.isnan(train_grad_flat).any():
@@ -1397,6 +1432,10 @@ class GRPOTrainer:
                 
                 # Compute inner product
                 ip = (val_grad_flat * train_grad_flat).sum().item()
+                
+                # DEBUG: First batch - print inner product details
+                if batch_idx == 0:
+                    print(f"DEBUG: Inner product result: {ip:.10f}")
                 
                 # FREE training gradients immediately
                 del batch_grads, train_grad_flat
@@ -1409,16 +1448,18 @@ class GRPOTrainer:
             for _ in range(batch_size):
                 ghost_ip.append(ip)
             
-            # FREE forward pass tensors
+            # FREE forward pass tensors AGGRESSIVELY
             del outputs, logits, mb_logprobs_new, response_logits, pg_loss
             del tracin_batch_dict, mb_model_inputs
             
-            # Periodic cache clear to prevent fragmentation
-            if batch_idx % 5 == 0:
+            # More frequent cache clearing to prevent memory accumulation
+            if batch_idx % 2 == 0:
+                gc.collect()
                 torch.cuda.empty_cache()
         
         # Final cleanup of validation gradients
         del val_grads, val_grad_flat
+        gc.collect()
         torch.cuda.empty_cache()
         
         log_gpu_memory("After training gradient loop", verbose=True)
@@ -1589,12 +1630,28 @@ class GRPOTrainer:
         stats["time/grpo/total"] = time.time() - t0
         
         # =====================
-        # Final memory cleanup
+        # Final memory cleanup (AGGRESSIVE)
         # =====================
-        # Delete batch_dict and intermediate tensors
-        del batch_dict
-        del logprobs, ref_logprobs, masks, rewards, advantages, advantages_expanded
-        del scores_tensor, model_inputs
+        # Delete batch_dict and ALL intermediate tensors
+        try:
+            del batch_dict
+        except:
+            pass
+        try:
+            del logprobs, ref_logprobs, masks, rewards, advantages, advantages_expanded
+        except:
+            pass
+        try:
+            del scores_tensor, model_inputs
+        except:
+            pass
+        try:
+            del trainable_params
+        except:
+            pass
+        
+        # Force garbage collection
+        gc.collect()
         torch.cuda.empty_cache()
         
         log_gpu_memory("End of step_tracin", verbose=True)
