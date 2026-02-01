@@ -1586,15 +1586,27 @@ class GRPOTrainer:
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             
-                            all_stats.append(stats)
+                            # Convert stats tensors to CPU/scalars before storing
+                            stats_cpu = {k: v.detach().cpu().item() if isinstance(v, torch.Tensor) else v for k, v in stats.items()}
+                            all_stats.append(stats_cpu)
+                            
+                            # FREE mini-batch tensors immediately
+                            del outputs, logits, mb_logprobs_new, response_logits, pg_loss
+                            del mb_logprobs_old, mb_advantages, mb_masks, mb_model_inputs
             
             timing["time/grpo/optimization"] = time.time() - t
+            
+            # Memory cleanup after training loop
+            gc.collect()
+            torch.cuda.empty_cache()
+            log_gpu_memory("After training loop", verbose=True)
         else:
             print("Warning: No samples with positive influence. Skipping training step.")
-            all_stats = [{"loss/policy": torch.tensor(0.0), "loss/total": torch.tensor(0.0)}]
+            all_stats = [{"loss/policy": 0.0, "loss/total": 0.0}]  # Use scalars directly
             timing["time/grpo/optimization"] = time.time() - t
         
         # Aggregate stats (with safety check for empty list)
+        # All stats are now scalars (converted to CPU in training loop)
         stats = {}
         if len(all_stats) == 0:
             print("WARNING: No training stats collected (training loop didn't execute). Using defaults.")
@@ -1604,10 +1616,7 @@ class GRPOTrainer:
             for key in all_stats[0].keys():
                 values = [s[key] for s in all_stats if key in s]
                 if len(values) > 0:
-                    if isinstance(values[0], torch.Tensor):
-                        stats[key] = torch.stack(values).mean()
-                    else:
-                        stats[key] = np.mean(values)
+                    stats[key] = np.mean(values)
         
         # Update KL controller
         kl = ((logprobs.detach() - ref_logprobs) * masks).sum(dim=-1).mean()
@@ -1630,33 +1639,82 @@ class GRPOTrainer:
         stats["time/grpo/total"] = time.time() - t0
         
         # =====================
-        # Final memory cleanup (AGGRESSIVE)
+        # Final memory cleanup (SAFE - explicit try/except blocks)
         # =====================
-        # Delete batch_dict and ALL intermediate tensors
+        # Save return values first (before deleting ghost_ip)
+        ghost_ip_copy = list(ghost_ip)
+        
+        # Delete batch_dict GPU tensors safely
         try:
-            del batch_dict
-        except:
+            if isinstance(batch_dict, dict):
+                for k in list(batch_dict.keys()):
+                    if isinstance(batch_dict[k], torch.Tensor) and batch_dict[k].is_cuda:
+                        del batch_dict[k]
+                del batch_dict
+        except (NameError, AttributeError, KeyError):
+            pass
+        
+        # Delete GPU tensors explicitly (safe - wrapped in try/except)
+        # These variables are defined in the function, so we can safely try to delete them
+        try:
+            del logprobs
+        except NameError:
             pass
         try:
-            del logprobs, ref_logprobs, masks, rewards, advantages, advantages_expanded
-        except:
+            del ref_logprobs
+        except NameError:
             pass
         try:
-            del scores_tensor, model_inputs
-        except:
+            del masks
+        except NameError:
+            pass
+        try:
+            del rewards
+        except NameError:
+            pass
+        try:
+            del advantages
+        except NameError:
+            pass
+        try:
+            del advantages_expanded
+        except NameError:
+            pass
+        try:
+            del scores_tensor
+        except NameError:
+            pass
+        try:
+            del model_inputs
+        except NameError:
             pass
         try:
             del trainable_params
-        except:
+        except NameError:
+            pass
+        try:
+            del selected_ids
+        except NameError:
+            pass
+        try:
+            del ghost_ip
+        except NameError:
+            pass
+        try:
+            del all_stats
+        except NameError:
             pass
         
-        # Force garbage collection
+        # Force Python garbage collection
         gc.collect()
+        gc.collect()
+        
+        # Empty CUDA cache
         torch.cuda.empty_cache()
         
-        log_gpu_memory("End of step_tracin", verbose=True)
+        log_gpu_memory("End of step_tracin (after cleanup)", verbose=True)
         
-        return stats, ghost_ip
+        return stats, ghost_ip_copy
 
     def loss(
         self,
