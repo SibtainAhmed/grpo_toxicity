@@ -445,9 +445,21 @@ def grpo_train_loop_with_validation(
         grpo_trainer.model, val_queries_batch, val_responses_batch, val_model_inputs
     )
     val_scores_tensor = torch.tensor(val_scores, device=device, dtype=torch.float32)
+    
+    # Handle NaN in validation scores
+    if torch.isnan(val_scores_tensor).any():
+        print("WARNING: Validation scores contain NaN! Replacing with 0.")
+        val_scores_tensor = torch.nan_to_num(val_scores_tensor, nan=0.0)
+    
     val_advantages = grpo_trainer.compute_group_advantages(val_scores_tensor, 1)  # No grouping for validation
     
+    # Handle NaN in validation advantages
+    if torch.isnan(val_advantages).any():
+        print("WARNING: Validation advantages contain NaN! Replacing with 0.")
+        val_advantages = torch.nan_to_num(val_advantages, nan=0.0)
+    
     print(f"Validation scores: mean={val_scores_tensor.mean():.4f}, std={val_scores_tensor.std():.4f}")
+    print(f"Validation advantages: mean={val_advantages.mean():.4f}, std={val_advantages.std():.4f}")
     
     epoch = 0
     all_ghost_ips = []  # Track influence scores across training
@@ -484,7 +496,18 @@ def grpo_train_loop_with_validation(
                 grpo_trainer.model, val_queries_batch, val_responses_batch, val_model_inputs
             )
             val_scores_tensor = torch.tensor(val_scores, device=device, dtype=torch.float32)
+            
+            # Handle NaN in validation scores
+            if torch.isnan(val_scores_tensor).any():
+                print("WARNING: Validation scores contain NaN! Replacing with 0.")
+                val_scores_tensor = torch.nan_to_num(val_scores_tensor, nan=0.0)
+            
             val_advantages = grpo_trainer.compute_group_advantages(val_scores_tensor, 1)
+            
+            # Handle NaN in validation advantages
+            if torch.isnan(val_advantages).any():
+                print("WARNING: Validation advantages contain NaN! Replacing with 0.")
+                val_advantages = torch.nan_to_num(val_advantages, nan=0.0)
             
             print(f"New validation scores: mean={val_scores_tensor.mean():.4f}")
         

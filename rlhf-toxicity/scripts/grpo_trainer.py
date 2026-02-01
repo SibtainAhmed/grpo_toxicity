@@ -1471,26 +1471,28 @@ class GRPOTrainer:
             all_stats = []
             self.model.train()
             
+            # Use smaller batch size if we have fewer samples than backward_batch_size
+            effective_backward_bs = min(self.config.backward_batch_size, sel_bs)
+            effective_mini_bs = min(self.config.mini_batch_size, effective_backward_bs)
+            
+            print(f"Training on {sel_bs} selected samples (effective_backward_bs={effective_backward_bs}, effective_mini_bs={effective_mini_bs})")
+            
             for epoch in range(self.config.grpo_epochs):
                 # Shuffle selected indices
                 b_inds = np.random.permutation(selected_ids)
                 
-                for backward_batch_start in range(0, sel_bs, self.config.backward_batch_size):
-                    backward_batch_end = backward_batch_start + self.config.backward_batch_size
-                    
-                    # Skip if batch is smaller than expected
-                    if backward_batch_end > sel_bs:
-                        break
-                    
+                for backward_batch_start in range(0, sel_bs, effective_backward_bs):
+                    backward_batch_end = min(backward_batch_start + effective_backward_bs, sel_bs)
                     backward_batch_inds = b_inds[backward_batch_start:backward_batch_end]
                     
-                    for mini_batch_start in range(0, self.config.backward_batch_size, self.config.mini_batch_size):
-                        mini_batch_end = mini_batch_start + self.config.mini_batch_size
-                        
-                        if mini_batch_end > len(backward_batch_inds):
-                            break
-                            
+                    # Process in mini-batches
+                    for mini_batch_start in range(0, len(backward_batch_inds), effective_mini_bs):
+                        mini_batch_end = min(mini_batch_start + effective_mini_bs, len(backward_batch_inds))
                         mini_batch_inds = backward_batch_inds[mini_batch_start:mini_batch_end]
+                        
+                        # Skip empty batches
+                        if len(mini_batch_inds) == 0:
+                            continue
                         
                         # Get mini-batch data
                         mb_logprobs_old = batch_dict["logprobs"][mini_batch_inds].detach()
@@ -1548,18 +1550,23 @@ class GRPOTrainer:
             timing["time/grpo/optimization"] = time.time() - t
         else:
             print("Warning: No samples with positive influence. Skipping training step.")
-            all_stats = [{"loss/policy": torch.tensor(0.0)}]
+            all_stats = [{"loss/policy": torch.tensor(0.0), "loss/total": torch.tensor(0.0)}]
             timing["time/grpo/optimization"] = time.time() - t
         
-        # Aggregate stats
+        # Aggregate stats (with safety check for empty list)
         stats = {}
-        for key in all_stats[0].keys():
-            values = [s[key] for s in all_stats if key in s]
-            if len(values) > 0:
-                if isinstance(values[0], torch.Tensor):
-                    stats[key] = torch.stack(values).mean()
-                else:
-                    stats[key] = np.mean(values)
+        if len(all_stats) == 0:
+            print("WARNING: No training stats collected (training loop didn't execute). Using defaults.")
+            stats = {"loss/policy": 0.0, "loss/total": 0.0}
+        else:
+            print(f"Aggregating stats from {len(all_stats)} training steps")
+            for key in all_stats[0].keys():
+                values = [s[key] for s in all_stats if key in s]
+                if len(values) > 0:
+                    if isinstance(values[0], torch.Tensor):
+                        stats[key] = torch.stack(values).mean()
+                    else:
+                        stats[key] = np.mean(values)
         
         # Update KL controller
         kl = ((logprobs.detach() - ref_logprobs) * masks).sum(dim=-1).mean()
