@@ -49,6 +49,17 @@ from transformers import (
 
 from grpo_config import GRPOConfig
 
+import contextlib
+@contextlib.contextmanager
+def ghost_mode(optimizer):
+    """Context manager to run backward pass without updating weights."""
+    _orig_step = optimizer.step
+    optimizer.step = lambda *a, **k: None
+    try:
+        yield
+    finally:
+        optimizer.step = _orig_step
+
 
 def set_seed(seed: int):
     """Set seed for reproducibility."""
@@ -283,6 +294,26 @@ class GRPOTrainer:
 
         # For saving
         self.save_cnt = 0
+        
+        # ========================================
+        # TracIn: Ghost gradient buffers and hooks
+        # ========================================
+        # Buffers for per-sample gradient computation (LoRA layers)
+        self._xs   = {}  # input activations to lora_A
+        self._hs   = {}  # output of lora_A (hidden states)
+        self._gAs  = {}  # gradients of lora_A
+        self._gBs  = {}  # gradients of lora_B
+        
+        # No value head in GRPO, so no _vxs, _vgs, _bgs needed
+        
+        self._record_ghost = False
+        self._train_xs = {}
+        self._train_hs = {}
+        self._train_gAs = {}
+        self._train_gBs = {}
+        
+        # Install hooks on LoRA layers for TracIn gradient tracking
+        self._install_ghost_hooks()
 
     def prepare_dataloader(self, dataset, data_collator=None):
         """Prepare the dataloader for training."""
@@ -313,6 +344,160 @@ class GRPOTrainer:
         """Set signature columns for dataset processing."""
         if self._signature_columns is None:
             self._signature_columns = ["input_ids", "attention_mask", "label", "query", "response"]
+
+    def _install_ghost_hooks(self):
+        """Install forward/backward hooks on LoRA layers for TracIn gradient tracking."""
+        try:
+            from peft.tuners.lora import LoraLayer
+        except ImportError:
+            print("PEFT not installed or no LoRA layers - TracIn hooks not installed")
+            return
+        
+        for name, module in self.model.named_modules():
+            # Hook LoRA adapters for ghost gradient computation
+            if isinstance(module, LoraLayer):
+                if not hasattr(module, 'lora_A') or not hasattr(module, 'lora_B'):
+                    continue
+                    
+                if not hasattr(module.lora_A, 'default') or not hasattr(module.lora_B, 'default'):
+                    continue
+                
+                r = module.lora_A.default.weight.shape[0]  # LoRA rank
+                
+                # Initialize buffers for this layer
+                self._xs[name]  = []
+                self._hs[name]  = []
+                self._gAs[name] = []
+                self._gBs[name] = []
+                
+                d_in_loraA = module.lora_A.default.weight.shape[1]
+                d_out_loraB = module.lora_B.default.weight.shape[0]
+                
+                # Forward hook on A: capture input x and output h = A @ x
+                def fwd_A(mod, inp, out, nm=name, d_in=d_in_loraA, rank=r):
+                    if not self._record_ghost:
+                        return
+                    x, = inp  # [B, S, d_in]
+                    h = out   # [B, S, r]
+                    self._xs[nm].append(x.detach().clone())
+                    self._hs[nm].append(h.detach().clone())
+                
+                module.lora_A.default.register_forward_hook(fwd_A)
+                
+                # Backward hook on B: capture gradients g_A = B^T @ g_out, and g_B
+                def bwd_B(mod, grad_inp, grad_out, nm=name, d_out=d_out_loraB, rank=r):
+                    if not self._record_ghost:
+                        return
+                    g_h = grad_inp[0]  # [B, S, r] - gradient w.r.t. lora_A output
+                    g_o = grad_out[0]  # [B, S, d_out] - gradient w.r.t. lora_B output
+                    self._gAs[nm].append(g_h.detach().clone())
+                    self._gBs[nm].append(g_o.detach().clone())
+                
+                module.lora_B.default.register_full_backward_hook(bwd_B)
+        
+        print(f"TracIn hooks installed on {len(self._xs)} LoRA layers")
+
+    def _clear_ghost_buffers(self):
+        """Clear ghost gradient buffers."""
+        for buf in (self._xs, self._hs, self._gAs, self._gBs):
+            for name in buf:
+                buf[name] = []
+    
+    def _save_train_buffers(self):
+        """Save training buffers before computing validation gradients."""
+        self._train_xs = copy.deepcopy(self._xs)
+        self._train_hs = copy.deepcopy(self._hs)
+        self._train_gAs = copy.deepcopy(self._gAs)
+        self._train_gBs = copy.deepcopy(self._gBs)
+        
+    def compute_ghost_grad_norm(self):
+        """Compute per-sample gradient norms for TracIn."""
+        sample_norms = np.zeros((self.config.batch_size,), dtype=np.float32)
+        
+        for name in self._xs:
+            if len(self._xs[name]) == 0:
+                continue
+            # Concatenate all micro-batches
+            X = torch.cat(self._xs[name], dim=0)    # [N, S, d_in]
+            H = torch.cat(self._hs[name], dim=0)    # [N, S, r]
+            GAt = torch.cat(self._gAs[name], dim=0) # [N, S, r]
+            GBt = torch.cat(self._gBs[name], dim=0) # [N, S, d_out]
+            
+            # Flatten sequence dimension for norm computation
+            N = X.shape[0]
+            X = X.view(N, -1)    # [N, S*d_in]
+            H = H.view(N, -1)    # [N, S*r]
+            GAt = GAt.view(N, -1)
+            GBt = GBt.view(N, -1)
+            
+            for i in range(min(N, len(sample_norms))):
+                # Per-sample gradient norm: ||grad||^2 = ||gA @ x^T||^2 + ||gB @ h^T||^2
+                block_A = ((GAt[i] @ GAt[i].T) * (X[i] @ X[i].T)).sum()
+                block_B = ((GBt[i] @ GBt[i].T) * (H[i] @ H[i].T)).sum()
+                sample_norms[i] += (block_A + block_B).item()
+        
+        return sample_norms.tolist()
+
+    def compute_ghost_inner_product_matrix_op(self):
+        """
+        Compute TracIn influence scores using efficient matrix operations.
+        Returns per-sample inner products between training and validation gradients.
+        """
+        sample_IP = torch.zeros((self.config.batch_size,), device=self.accelerator.device)
+        
+        def compute_sample_ip_vec(GAt, GBt, train_GAt, train_GBt, X, H):
+            """
+            Vectorized inner product computation:
+            IP[i] = sum_j <grad_train[i], grad_valid[j]>
+            """
+            # Block A: P_A[j] = GAt[j].T @ X[j], Q_A[i] = train_GAt[i].T @ X[i]
+            # For sequence data, we need to handle the sequence dimension
+            N = GAt.shape[0]
+            
+            # Reshape for matrix operations: [N, S*r], [N, S*d_in]
+            GAt_flat = GAt.view(N, -1)
+            train_GAt_flat = train_GAt.view(N, -1)
+            X_flat = X.view(N, -1)
+            
+            GBt_flat = GBt.view(N, -1)
+            train_GBt_flat = train_GBt.view(N, -1)
+            H_flat = H.view(N, -1)
+            
+            # Compute outer products and sum
+            # For block A: sum over all validation samples, then compute IP with each training sample
+            # This is an approximation that works for batch-level TracIn
+            S_gA = GAt_flat.sum(dim=0)  # [S*r]
+            S_x = X_flat.sum(dim=0)     # [S*d_in]
+            
+            # Per-sample IP for block A
+            sample_IP_A = (train_GAt_flat * S_gA.unsqueeze(0)).sum(dim=1) * (X_flat * S_x.unsqueeze(0)).sum(dim=1)
+            
+            # Block B: same approach
+            S_gB = GBt_flat.sum(dim=0)
+            S_h = H_flat.sum(dim=0)
+            
+            sample_IP_B = (train_GBt_flat * S_gB.unsqueeze(0)).sum(dim=1) * (H_flat * S_h.unsqueeze(0)).sum(dim=1)
+            
+            return sample_IP_A + sample_IP_B
+        
+        for name in self._xs:
+            if len(self._xs[name]) == 0 or len(self._train_xs.get(name, [])) == 0:
+                continue
+            
+            # Concatenate all micro-batches
+            X = torch.cat(self._train_xs[name], dim=0)
+            H = torch.cat(self._train_hs[name], dim=0)
+            train_GAt = torch.cat(self._train_gAs[name], dim=0)
+            train_GBt = torch.cat(self._train_gBs[name], dim=0)
+            
+            GAt = torch.cat(self._gAs[name], dim=0)
+            GBt = torch.cat(self._gBs[name], dim=0)
+            
+            N = min(X.shape[0], len(sample_IP))
+            ip = compute_sample_ip_vec(GAt[:N], GBt[:N], train_GAt[:N], train_GBt[:N], X[:N], H[:N])
+            sample_IP[:N] += ip[:N]
+        
+        return sample_IP.cpu().numpy().tolist()
 
     @property
     def device(self):
@@ -887,6 +1072,383 @@ class GRPOTrainer:
         stats["time/grpo/total"] = time.time() - t0
         
         return stats
+
+    def step_tracin(
+        self,
+        queries: List[torch.LongTensor],
+        responses: List[torch.LongTensor],
+        scores: List[torch.FloatTensor],
+        val_queries: List[torch.LongTensor],
+        val_responses: List[torch.LongTensor],
+        val_advantages: torch.FloatTensor,
+        val_logprobs: torch.FloatTensor,
+        val_masks: torch.FloatTensor,
+        gen_data_dir: str = None,
+    ):
+        """
+        Run a GRPO optimization step with TracIn influence-based sample selection.
+        
+        This method:
+        1. Computes ghost gradients for training samples
+        2. Computes validation gradient
+        3. Computes influence scores (gradient inner products)
+        4. Selects samples with positive influence
+        5. Trains only on selected samples
+        
+        Args:
+            queries: List of query tensors
+            responses: List of response tensors
+            scores: List of reward scores
+            val_queries: Validation query tensors
+            val_responses: Validation response tensors
+            val_advantages: Validation advantages
+            val_logprobs: Validation log probabilities
+            val_masks: Validation masks
+            gen_data_dir: Directory to save generated data
+            
+        Returns:
+            stats: Dictionary of training statistics
+            ghost_ip: List of influence scores per sample
+        """
+        timing = {}
+        t0 = time.time()
+        
+        bs = len(queries)
+        
+        # =====================
+        # Part I: Compute forward pass and ghost gradients for training data
+        # =====================
+        
+        # Prepare model inputs
+        t = time.time()
+        model_inputs = self.prepare_model_inputs(queries, responses)
+        model_inputs_names = list(model_inputs.keys())
+        timing["time/grpo/prepare_inputs"] = time.time() - t
+        
+        # Put model in eval mode for gradient computation
+        self.model.eval()
+        for module in self.model.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.eval()
+        
+        # Forward pass with ghost recording enabled
+        t = time.time()
+        self._record_ghost = True
+        logprobs, masks = self.compute_logprobs(self.model, queries, responses, model_inputs)
+        self._record_ghost = False
+        
+        # Get reference log probs
+        with torch.no_grad():
+            if self.is_peft_model and hasattr(
+                self.accelerator.unwrap_model(self.model), "disable_adapter"
+            ):
+                with self.accelerator.unwrap_model(self.model).disable_adapter():
+                    ref_logprobs, _ = self.compute_logprobs(self.model, queries, responses, model_inputs)
+            elif self.ref_model is not None:
+                ref_logprobs, _ = self.compute_logprobs(self.ref_model, queries, responses, model_inputs)
+            else:
+                ref_logprobs = logprobs.detach().clone()
+        
+        timing["time/grpo/forward_pass"] = time.time() - t
+        
+        # Convert scores to tensor
+        scores_tensor = torch.tensor(scores, device=self.current_device, dtype=torch.float32)
+        
+        # Compute rewards with KL penalty
+        t = time.time()
+        rewards, non_score_reward = self.compute_rewards_with_kl(scores_tensor, logprobs.detach(), ref_logprobs, masks)
+        timing["time/grpo/compute_rewards"] = time.time() - t
+        
+        # Compute group-relative advantages
+        t = time.time()
+        advantages = self.compute_group_advantages(scores_tensor, self.config.num_generations)
+        advantages_expanded = advantages.unsqueeze(-1).expand_as(logprobs)
+        timing["time/grpo/compute_advantages"] = time.time() - t
+        
+        # Prepare batch dict
+        batch_dict = {
+            "queries": queries,
+            "responses": responses,
+            "logprobs": logprobs.to(torch.float32),
+            "masks": masks,
+            "advantages": advantages,
+            "advantages_expanded": advantages_expanded,
+        }
+        batch_dict.update(model_inputs)
+        
+        # =====================
+        # Part II: Compute ghost gradients for training samples
+        # =====================
+        t = time.time()
+        
+        self._record_ghost = True
+        self._clear_ghost_buffers()
+        
+        # Store response lengths for consistent indexing
+        response_lengths = [len(r) for r in responses]
+        max_response_len = logprobs.shape[1]
+        
+        # Process in TracIn batches
+        for tracin_batch_start in range(0, bs, self.config.tracin_batch_size):
+            tracin_batch_end = min(tracin_batch_start + self.config.tracin_batch_size, bs)
+            tracin_batch_inds = np.arange(tracin_batch_start, tracin_batch_end)
+            
+            print(f'TracIn batch indices: {tracin_batch_inds}')
+            
+            tracin_batch_dict = {
+                "logprobs": batch_dict["logprobs"][tracin_batch_inds],
+                "masks": batch_dict["masks"][tracin_batch_inds],
+                "queries": [batch_dict["queries"][i] for i in tracin_batch_inds],
+                "responses": [batch_dict["responses"][i] for i in tracin_batch_inds],
+                "advantages": batch_dict["advantages"][tracin_batch_inds],
+                "advantages_expanded": batch_dict["advantages_expanded"][tracin_batch_inds],
+            }
+            for k in model_inputs_names:
+                tracin_batch_dict[k] = batch_dict[k][tracin_batch_inds]
+            
+            mb_model_inputs = {k: tracin_batch_dict[k] for k in model_inputs_names}
+            
+            # Forward pass
+            outputs = self.model(
+                input_ids=mb_model_inputs["input_ids"],
+                attention_mask=mb_model_inputs["attention_mask"],
+            )
+            logits = outputs.logits
+            
+            # Compute new log probs
+            mb_logprobs_new = self._compute_logprobs_consistent(
+                logits, tracin_batch_dict["queries"], tracin_batch_dict["responses"],
+                mb_model_inputs, max_response_len
+            )
+            
+            # Extract response logits for entropy
+            response_logits = self._extract_response_logits_consistent(
+                logits, tracin_batch_dict["queries"], tracin_batch_dict["responses"],
+                max_response_len
+            )
+            
+            # Compute loss with ghost mode (no optimizer step)
+            with ghost_mode(self.optimizer):
+                pg_loss, stats = self.loss(
+                    tracin_batch_dict["logprobs"].detach(),
+                    response_logits,
+                    mb_logprobs_new,
+                    tracin_batch_dict["masks"].detach(),
+                    tracin_batch_dict["advantages_expanded"].detach(),
+                )
+                
+                # Backward pass to capture gradients
+                self.accelerator.backward(pg_loss, retain_graph=True)
+                self.optimizer.zero_grad()
+        
+        self._record_ghost = False
+        
+        # Save training buffers
+        self._save_train_buffers()
+        
+        timing["time/grpo/ghost_forward"] = time.time() - t
+        
+        # =====================
+        # Part III: Compute validation gradient
+        # =====================
+        t = time.time()
+        
+        # Compute validation loss based on val_loss_type
+        if self.config.val_loss_type == 'sample-level-orig':
+            masked_term = val_advantages.unsqueeze(-1) * val_logprobs.to(torch.float32) * val_masks.detach()
+            per_sample_num = val_masks.sum(dim=1).clamp(min=1)
+            per_sample_sum = masked_term.sum(dim=1)
+            per_sample_loss = -per_sample_sum / per_sample_num
+            validation_loss = per_sample_loss.mean()
+            print(f'Validation loss (sample-level-orig): {validation_loss.item():.4f}')
+            
+        elif self.config.val_loss_type == 'rough-orig':
+            validation_loss = -torch.mean(val_advantages.unsqueeze(-1) * val_logprobs.to(torch.float32) * val_masks.detach())
+            print(f'Validation loss (rough-orig): {validation_loss.item():.4f}')
+            
+        elif self.config.val_loss_type == 'seqloss-lastadv':
+            seq_logprob = (val_logprobs.to(torch.float32) * val_masks.detach()).sum(dim=1)
+            # Get last valid token position
+            indices = torch.argmax(val_masks.detach().float(), dim=1) + val_masks.sum(dim=1) - 1
+            indices = indices.long().clamp(0, val_advantages.shape[-1] - 1 if val_advantages.dim() > 1 else 0)
+            if val_advantages.dim() > 1:
+                seq_score = val_advantages[torch.arange(val_advantages.size(0)), indices]
+            else:
+                seq_score = val_advantages
+            per_seq_loss = -seq_logprob * seq_score
+            validation_loss = per_seq_loss.mean()
+            print(f'Validation loss (seqloss-lastadv): {validation_loss.item():.4f}')
+            
+        else:
+            raise NotImplementedError(f"Validation loss type {self.config.val_loss_type} not implemented.")
+        
+        # Clear gradient buffers for backward
+        for buf in (self._gAs, self._gBs):
+            for name in buf:
+                buf[name] = []
+        
+        self._record_ghost = True
+        self.accelerator.backward(validation_loss)
+        self._record_ghost = False
+        self.optimizer.zero_grad()
+        
+        timing["time/grpo/validation_gradient"] = time.time() - t
+        
+        # =====================
+        # Part IV: Compute influence scores
+        # =====================
+        t = time.time()
+        
+        ghost_ip = self.compute_ghost_inner_product_matrix_op()
+        print(f"Ghost gradient inner products: {ghost_ip[:10]}...")  # Print first 10
+        
+        timing["time/grpo/tracin_calculation"] = time.time() - t
+        
+        # =====================
+        # Part V: Select samples with positive influence and train
+        # =====================
+        t = time.time()
+        
+        # Select samples with positive influence
+        selected_ids = np.where(np.array(ghost_ip) > 0)[0]
+        print(f'Number of selected samples (positive influence): {len(selected_ids)} / {bs}')
+        
+        # Save generated data if requested
+        if gen_data_dir is not None:
+            os.makedirs(gen_data_dir, exist_ok=True)
+            torch.save({
+                "queries": queries,
+                "responses": responses,
+                "scores": scores_tensor.cpu(),
+                "rewards": rewards.cpu(),
+                "advantages": advantages.cpu(),
+                "logprobs": logprobs.cpu(),
+                "ref_logprobs": ref_logprobs.cpu(),
+                "masks": masks.cpu(),
+                "kl_ctl_value": self.kl_ctl.value,
+                "ghost_ip": ghost_ip,
+                "selected_ids": selected_ids.tolist(),
+            }, f'{gen_data_dir}/grpo_tracin_samples_seed-{self.config.seed}_{self.save_cnt}.pt')
+            print(f'File saved to {gen_data_dir}/grpo_tracin_samples_seed-{self.config.seed}_{self.save_cnt}.pt')
+            self.save_cnt += 1
+        
+        # Train on selected samples
+        if len(selected_ids) > 0:
+            sel_bs = len(selected_ids)
+            all_stats = []
+            self.model.train()
+            
+            for epoch in range(self.config.grpo_epochs):
+                # Shuffle selected indices
+                b_inds = np.random.permutation(selected_ids)
+                
+                for backward_batch_start in range(0, sel_bs, self.config.backward_batch_size):
+                    backward_batch_end = backward_batch_start + self.config.backward_batch_size
+                    
+                    # Skip if batch is smaller than expected
+                    if backward_batch_end > sel_bs:
+                        break
+                    
+                    backward_batch_inds = b_inds[backward_batch_start:backward_batch_end]
+                    
+                    for mini_batch_start in range(0, self.config.backward_batch_size, self.config.mini_batch_size):
+                        mini_batch_end = mini_batch_start + self.config.mini_batch_size
+                        
+                        if mini_batch_end > len(backward_batch_inds):
+                            break
+                            
+                        mini_batch_inds = backward_batch_inds[mini_batch_start:mini_batch_end]
+                        
+                        # Get mini-batch data
+                        mb_logprobs_old = batch_dict["logprobs"][mini_batch_inds].detach()
+                        mb_advantages = batch_dict["advantages_expanded"][mini_batch_inds].detach()
+                        mb_masks = batch_dict["masks"][mini_batch_inds]
+                        mb_queries = [batch_dict["queries"][i] for i in mini_batch_inds]
+                        mb_responses = [batch_dict["responses"][i] for i in mini_batch_inds]
+                        
+                        mb_model_inputs = {
+                            "input_ids": batch_dict["input_ids"][mini_batch_inds],
+                            "attention_mask": batch_dict["attention_mask"][mini_batch_inds],
+                        }
+                        
+                        # Forward pass
+                        with self.accelerator.accumulate(self.model):
+                            outputs = self.model(
+                                input_ids=mb_model_inputs["input_ids"],
+                                attention_mask=mb_model_inputs["attention_mask"],
+                            )
+                            logits = outputs.logits
+                            
+                            # Compute new log probs
+                            mb_logprobs_new = self._compute_logprobs_consistent(
+                                logits, mb_queries, mb_responses, mb_model_inputs, max_response_len
+                            )
+                            
+                            # Extract response logits
+                            response_logits = self._extract_response_logits_consistent(
+                                logits, mb_queries, mb_responses, max_response_len
+                            )
+                            
+                            # Compute loss
+                            pg_loss, stats = self.loss(
+                                mb_logprobs_old,
+                                response_logits,
+                                mb_logprobs_new,
+                                mb_masks,
+                                mb_advantages,
+                            )
+                            
+                            # Backward pass
+                            self.accelerator.backward(pg_loss)
+                            
+                            if self.config.max_grad_norm is not None:
+                                torch.nn.utils.clip_grad_norm_(
+                                    self.model.parameters(),
+                                    self.config.max_grad_norm
+                                )
+                            
+                            self.optimizer.step()
+                            self.optimizer.zero_grad()
+                            
+                            all_stats.append(stats)
+            
+            timing["time/grpo/optimization"] = time.time() - t
+        else:
+            print("Warning: No samples with positive influence. Skipping training step.")
+            all_stats = [{"loss/policy": torch.tensor(0.0)}]
+            timing["time/grpo/optimization"] = time.time() - t
+        
+        # Aggregate stats
+        stats = {}
+        for key in all_stats[0].keys():
+            values = [s[key] for s in all_stats if key in s]
+            if len(values) > 0:
+                if isinstance(values[0], torch.Tensor):
+                    stats[key] = torch.stack(values).mean()
+                else:
+                    stats[key] = np.mean(values)
+        
+        # Update KL controller
+        kl = ((logprobs.detach() - ref_logprobs) * masks).sum(dim=-1).mean()
+        self.kl_ctl.update(kl.item(), bs)
+        
+        # Record step stats
+        stats.update(self.record_step_stats(
+            kl_coef=self.kl_ctl.value,
+            logprobs=logprobs.detach(),
+            ref_logprobs=ref_logprobs,
+            masks=masks,
+            scores=scores_tensor,
+            rewards=rewards,
+        ))
+        stats["tracin/num_selected"] = len(selected_ids)
+        stats["tracin/selection_ratio"] = len(selected_ids) / bs
+        stats["tracin/mean_ip"] = np.mean(ghost_ip)
+        stats["tracin/std_ip"] = np.std(ghost_ip)
+        stats.update(timing)
+        stats["time/grpo/total"] = time.time() - t0
+        
+        return stats, ghost_ip
 
     def loss(
         self,

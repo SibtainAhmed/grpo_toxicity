@@ -383,15 +383,22 @@ def grpo_train_loop_with_validation(
     min_length=20,
 ):
     """
-    GRPO training loop with TracIn-style validation.
-    Uses validation set to compute influence scores for sample selection.
+    GRPO training loop with TracIn influence-based sample selection.
+    
+    This loop:
+    1. Generates training responses
+    2. Generates validation responses (for TracIn gradient computation)
+    3. Computes per-sample influence scores via gradient inner products
+    4. Trains only on samples with positive influence
     """
     print("=" * 50)
-    print("Starting GRPO Training Loop with TracIn Validation")
+    print("Starting GRPO Training Loop with FULL TracIn")
     print(f"Steps: {script_args.steps}")
     print(f"Batch size: {script_args.batch_size}")
     print(f"Num generations per prompt: {script_args.num_generations}")
     print(f"Validation size: {len(val_question_tensors)}")
+    print(f"TracIn batch size: {script_args.tracin_batch_size}")
+    print(f"Val loss type: {script_args.val_loss_type}")
     print("=" * 50)
     
     # Generation kwargs
@@ -409,14 +416,77 @@ def grpo_train_loop_with_validation(
     dataloader = grpo_trainer.dataloader
     device = grpo_trainer.current_device
     
+    # Pre-generate validation responses once (or regenerate periodically)
+    val_sample_size = min(script_args.tracin_val_batch_size, len(val_question_tensors))
+    val_regenerate_freq = 10  # Regenerate validation responses every N steps
+    
+    # Initial validation generation
+    print(f"\nGenerating validation responses for {val_sample_size} samples...")
+    val_sample_indices = torch.randperm(len(val_question_tensors))[:val_sample_size]
+    val_queries_batch = [val_question_tensors[idx].to(device) for idx in val_sample_indices]
+    
+    with torch.no_grad():
+        val_responses_batch = grpo_trainer.generate(
+            val_queries_batch,
+            batch_size=val_sample_size,
+            return_prompt=False,
+            **generation_kwargs
+        )
+    
+    # Compute validation rewards and advantages
+    val_response_texts = tokenizer.batch_decode(val_responses_batch, skip_special_tokens=True)
+    val_query_texts = [val_questions[idx] for idx in val_sample_indices]
+    val_full_texts = [q + r for q, r in zip(val_query_texts, val_response_texts)]
+    val_scores = get_reward_scores(reward_model, reward_tokenizer, val_full_texts, device)
+    
+    # Compute validation model inputs for gradient computation
+    val_model_inputs = grpo_trainer.prepare_model_inputs(val_queries_batch, val_responses_batch)
+    val_logprobs, val_masks = grpo_trainer.compute_logprobs(
+        grpo_trainer.model, val_queries_batch, val_responses_batch, val_model_inputs
+    )
+    val_scores_tensor = torch.tensor(val_scores, device=device, dtype=torch.float32)
+    val_advantages = grpo_trainer.compute_group_advantages(val_scores_tensor, 1)  # No grouping for validation
+    
+    print(f"Validation scores: mean={val_scores_tensor.mean():.4f}, std={val_scores_tensor.std():.4f}")
+    
     epoch = 0
-    for batch in tqdm(dataloader, desc="GRPO Training with TracIn"):
+    all_ghost_ips = []  # Track influence scores across training
+    
+    for batch in tqdm(dataloader, desc="GRPO TracIn Training"):
         if epoch >= script_args.steps:
             break
         epoch += 1
         
         timing = {}
         t0 = time.time()
+        
+        # Periodically regenerate validation responses for diversity
+        if epoch % val_regenerate_freq == 0:
+            print(f"\n[Step {epoch}] Regenerating validation responses...")
+            val_sample_indices = torch.randperm(len(val_question_tensors))[:val_sample_size]
+            val_queries_batch = [val_question_tensors[idx].to(device) for idx in val_sample_indices]
+            
+            with torch.no_grad():
+                val_responses_batch = grpo_trainer.generate(
+                    val_queries_batch,
+                    batch_size=val_sample_size,
+                    return_prompt=False,
+                    **generation_kwargs
+                )
+            
+            val_response_texts = tokenizer.batch_decode(val_responses_batch, skip_special_tokens=True)
+            val_query_texts = [val_questions[idx] for idx in val_sample_indices]
+            val_full_texts = [q + r for q, r in zip(val_query_texts, val_response_texts)]
+            val_scores = get_reward_scores(reward_model, reward_tokenizer, val_full_texts, device)
+            
+            val_model_inputs = grpo_trainer.prepare_model_inputs(val_queries_batch, val_responses_batch)
+            val_logprobs, val_masks = grpo_trainer.compute_logprobs(
+                grpo_trainer.model, val_queries_batch, val_responses_batch, val_model_inputs
+            )
+            val_scores_tensor = torch.tensor(val_scores, device=device, dtype=torch.float32)
+            val_advantages = grpo_trainer.compute_group_advantages(val_scores_tensor, 1)
+            
+            print(f"New validation scores: mean={val_scores_tensor.mean():.4f}")
         
         # Get query tensors
         question_tensors = batch["input_ids"]
@@ -457,41 +527,21 @@ def grpo_train_loop_with_validation(
         scores = get_reward_scores(reward_model, reward_tokenizer, full_texts, device)
         timing["time/grpo/reward"] = time.time() - t
         
-        # For TracIn: also evaluate on validation set periodically
-        if epoch % 10 == 0:
-            t = time.time()
-            # Generate responses for validation set (sample)
-            val_sample_size = min(16, len(val_question_tensors))
-            val_sample_indices = torch.randperm(len(val_question_tensors))[:val_sample_size]
-            
-            # Batched validation generation
-            val_queries_batch = [val_question_tensors[idx].to(device) for idx in val_sample_indices]
-            with torch.no_grad():
-                val_responses = grpo_trainer.generate(
-                    val_queries_batch,
-                    batch_size=val_sample_size,
-                    return_prompt=False,
-                    **generation_kwargs
-                )
-            
-            val_response_texts = tokenizer.batch_decode(val_responses, skip_special_tokens=True)
-            val_query_texts = [val_questions[idx] for idx in val_sample_indices]
-            val_full_texts = [q + r for q, r in zip(val_query_texts, val_response_texts)]
-            
-            val_scores = get_reward_scores(reward_model, reward_tokenizer, val_full_texts, device)
-            timing["time/grpo/validation"] = time.time() - t
-            
-            print(f"\n[Step {epoch}] Validation reward: {mean(val_scores):.4f}")
-        
-        # Run GRPO step
+        # Run GRPO TracIn step
         t = time.time()
-        stats = grpo_trainer.step(
+        stats, ghost_ip = grpo_trainer.step_tracin(
             queries=all_queries,
             responses=all_responses,
             scores=scores,
+            val_queries=val_queries_batch,
+            val_responses=val_responses_batch,
+            val_advantages=val_advantages,
+            val_logprobs=val_logprobs,
+            val_masks=val_masks,
             gen_data_dir=script_args.gen_data_dir,
         )
         timing["time/grpo/step"] = time.time() - t
+        all_ghost_ips.extend(ghost_ip)
         
         # Log stats
         stats.update(timing)
@@ -506,7 +556,10 @@ def grpo_train_loop_with_validation(
         
         # Print progress
         if epoch % 10 == 0:
-            print(f"[Step {epoch}] Train reward: {mean(scores):.4f}, KL coef: {grpo_trainer.kl_ctl.value:.4f}")
+            print(f"\n[Step {epoch}] Train reward: {mean(scores):.4f}")
+            print(f"  TracIn selection: {stats.get('tracin/num_selected', 0)} / {len(all_queries)}")
+            print(f"  Mean IP: {stats.get('tracin/mean_ip', 0):.6f}")
+            print(f"  KL coef: {grpo_trainer.kl_ctl.value:.4f}")
         
         # Save checkpoint
         if script_args.save_freq and epoch % script_args.save_freq == 0:
@@ -517,6 +570,17 @@ def grpo_train_loop_with_validation(
     final_path = os.path.join(script_args.output_dir, "final")
     grpo_trainer.save_pretrained(final_path)
     print(f"\nTraining complete! Final model saved to {final_path}")
+    
+    # Save TracIn statistics
+    import json
+    tracin_stats = {
+        "total_samples": len(all_ghost_ips),
+        "positive_ratio": sum(1 for ip in all_ghost_ips if ip > 0) / len(all_ghost_ips) if all_ghost_ips else 0,
+        "mean_ip": mean(all_ghost_ips) if all_ghost_ips else 0,
+    }
+    with open(os.path.join(script_args.output_dir, "tracin_stats.json"), "w") as f:
+        json.dump(tracin_stats, f, indent=2)
+    print(f"TracIn stats saved: {tracin_stats}")
 
 
 # Main execution

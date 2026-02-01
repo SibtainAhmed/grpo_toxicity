@@ -184,6 +184,12 @@ class GRPOConfig(object):
         default=1.0,
         metadata={"help": "Temperature for sampling during generation"}
     )
+    
+    # TracIn-specific settings
+    sanity_check: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Enable sanity checks for TracIn gradient computation"}
+    )
 
     def __post_init__(self):
         if self.forward_batch_size is not None:
