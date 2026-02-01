@@ -4,6 +4,7 @@
 import os
 import sys
 import time
+import gc
 import torch
 from dataclasses import dataclass, field
 from typing import Optional
@@ -583,6 +584,38 @@ def grpo_train_loop_with_validation(
             print(f"  TracIn selection: {stats.get('tracin/num_selected', 0)} / {len(all_queries)}")
             print(f"  Mean IP: {stats.get('tracin/mean_ip', 0):.6f}")
             print(f"  KL coef: {grpo_trainer.kl_ctl.value:.4f}")
+        
+        # =====================
+        # MEMORY CLEANUP (per step) - Critical for preventing OOM!
+        # =====================
+        # Delete GPU tensors from this iteration
+        try:
+            del all_queries, expanded_queries, all_responses
+        except NameError:
+            pass
+        try:
+            del question_tensors, queries_text
+        except NameError:
+            pass
+        try:
+            del full_texts, query_texts, response_texts
+        except NameError:
+            pass
+        try:
+            del stats, batch_log, timing
+        except NameError:
+            pass
+        try:
+            del scores
+        except NameError:
+            pass
+        
+        # Note: validation variables (val_responses_batch, val_logprobs, etc.) 
+        # are intentionally kept for reuse across steps
+        
+        # Force garbage collection and clear CUDA cache
+        gc.collect()
+        torch.cuda.empty_cache()
         
         # Save checkpoint
         if script_args.save_freq and epoch % script_args.save_freq == 0:
