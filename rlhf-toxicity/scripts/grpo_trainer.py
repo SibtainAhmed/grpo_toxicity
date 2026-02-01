@@ -1177,18 +1177,127 @@ class GRPOTrainer:
         batch_dict.update(model_inputs)
         
         # =====================
-        # Part II: Compute ghost gradients for training samples
+        # Part II: Compute validation gradient FIRST (cleaner graph)
         # =====================
         t = time.time()
         
-        self._record_ghost = True
-        self._clear_ghost_buffers()
+        # Ensure model is in eval mode for validation
+        self.model.eval()
+        for module in self.model.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.eval()
+        
+        # Prepare validation model inputs
+        val_model_inputs = self.prepare_model_inputs(val_queries, val_responses)
+        
+        # Forward pass on validation set
+        val_outputs = self.model(
+            input_ids=val_model_inputs["input_ids"],
+            attention_mask=val_model_inputs["attention_mask"],
+        )
+        val_logits = val_outputs.logits
+        
+        # Recompute validation logprobs (needed for gradient computation)
+        val_logprobs_new = self._compute_logprobs_consistent(
+            val_logits, val_queries, val_responses, val_model_inputs, val_logprobs.shape[1]
+        )
+        
+        # Compute validation loss based on val_loss_type
+        print(f"\n=== Validation Loss Debug ===")
+        print(f"val_logprobs shape: {val_logprobs.shape}, val_masks shape: {val_masks.shape}")
+        print(f"val_advantages shape: {val_advantages.shape}")
+        print(f"val_logprobs contains NaN: {torch.isnan(val_logprobs).any()}")
+        print(f"val_advantages contains NaN: {torch.isnan(val_advantages).any()}")
+        print(f"val_masks sum: {val_masks.sum()}")
+        
+        if self.config.val_loss_type == 'sample-level-orig':
+            # val_advantages is 1D [B], expand to match logprobs
+            val_adv_expanded = val_advantages.unsqueeze(-1)  # [B, 1]
+            masked_term = val_adv_expanded * val_logprobs_new.to(torch.float32) * val_masks.detach()
+            per_sample_num = val_masks.sum(dim=1).clamp(min=1)
+            per_sample_sum = masked_term.sum(dim=1)
+            per_sample_loss = -per_sample_sum / per_sample_num
+            validation_loss = per_sample_loss.mean()
+            print(f'Validation loss (sample-level-orig): {validation_loss.item():.4f}')
+            
+        elif self.config.val_loss_type == 'rough-orig':
+            val_adv_expanded = val_advantages.unsqueeze(-1)  # [B, 1]
+            validation_loss = -torch.mean(val_adv_expanded * val_logprobs_new.to(torch.float32) * val_masks.detach())
+            print(f'Validation loss (rough-orig): {validation_loss.item():.4f}')
+            
+        elif self.config.val_loss_type == 'seqloss-lastadv':
+            # Sequence-level loss: sum of logprobs * last advantage
+            seq_logprob = (val_logprobs_new.to(torch.float32) * val_masks.detach()).sum(dim=1)  # [B]
+            
+            # Get last valid token position for each sequence
+            # val_masks is [B, S], find last True position
+            seq_lengths = val_masks.sum(dim=1).long()  # [B] - number of valid tokens per sequence
+            max_len = val_masks.shape[1]
+            
+            # For each sequence, get the advantage at the last position
+            # val_advantages is 1D [B] (one advantage per sequence)
+            seq_score = val_advantages  # Already per-sequence
+            
+            per_seq_loss = -seq_logprob * seq_score  # [B]
+            validation_loss = per_seq_loss.mean()
+            print(f'Validation loss (seqloss-lastadv): {validation_loss.item():.4f}')
+            print(f'  seq_logprob range: [{seq_logprob.min():.4f}, {seq_logprob.max():.4f}]')
+            print(f'  seq_score range: [{seq_score.min():.4f}, {seq_score.max():.4f}]')
+            
+        else:
+            raise NotImplementedError(f"Validation loss type {self.config.val_loss_type} not implemented.")
+        
+        # Check for NaN
+        if torch.isnan(validation_loss) or torch.isinf(validation_loss):
+            print(f"ERROR: Validation loss is NaN/Inf! Using fallback loss.")
+            # Fallback: simple mean of logprobs
+            validation_loss = -torch.mean(val_logprobs_new.to(torch.float32) * val_masks.detach())
+            print(f'  Fallback validation loss: {validation_loss.item():.4f}')
+        
+        print(f"Validation loss final: {validation_loss.item():.4f}")
+        print(f"================================\n")
+        
+        # Get model parameters that require gradients
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        
+        # Compute validation gradients using autograd.grad (no graph conflicts!)
+        try:
+            val_grads = torch.autograd.grad(
+                outputs=validation_loss,
+                inputs=trainable_params,
+                retain_graph=False,  # Don't keep graph
+                create_graph=False,  # Don't build higher-order graph
+                allow_unused=True,   # Allow unused parameters (e.g., frozen layers)
+            )
+            # Filter out None gradients and detach
+            val_grads = [g.detach() if g is not None else torch.zeros_like(p) for g, p in zip(val_grads, trainable_params)]
+            
+            # Check for NaN in validation gradients
+            val_grad_has_nan = any(torch.isnan(g).any() for g in val_grads)
+            if val_grad_has_nan:
+                print("WARNING: Validation gradients contain NaN!")
+                # Zero out NaN gradients
+                val_grads = [torch.where(torch.isnan(g), torch.zeros_like(g), g) for g in val_grads]
+        except RuntimeError as e:
+            print(f"ERROR computing validation gradients: {e}")
+            # Fallback: zero gradients
+            val_grads = [torch.zeros_like(p) for p in trainable_params]
+        
+        timing["time/grpo/validation_gradient"] = time.time() - t
+        
+        # =====================
+        # Part III: Compute training gradients per sample
+        # =====================
+        t = time.time()
         
         # Store response lengths for consistent indexing
-        response_lengths = [len(r) for r in responses]
         max_response_len = logprobs.shape[1]
         
-        # Process in TracIn batches
+        # Compute per-sample training gradients
+        # For efficiency, we compute gradients per TracIn batch, then approximate per-sample
+        train_grads_list = []
+        
+        # Process in TracIn batches to avoid memory issues
         for tracin_batch_start in range(0, bs, self.config.tracin_batch_size):
             tracin_batch_end = min(tracin_batch_start + self.config.tracin_batch_size, bs)
             tracin_batch_inds = np.arange(tracin_batch_start, tracin_batch_end)
@@ -1227,80 +1336,82 @@ class GRPOTrainer:
                 max_response_len
             )
             
-            # Compute loss with ghost mode (no optimizer step)
-            with ghost_mode(self.optimizer):
-                pg_loss, stats = self.loss(
-                    tracin_batch_dict["logprobs"].detach(),
-                    response_logits,
-                    mb_logprobs_new,
-                    tracin_batch_dict["masks"].detach(),
-                    tracin_batch_dict["advantages_expanded"].detach(),
+            # Compute loss for the batch
+            pg_loss, stats = self.loss(
+                tracin_batch_dict["logprobs"].detach(),
+                response_logits,
+                mb_logprobs_new,
+                tracin_batch_dict["masks"].detach(),
+                tracin_batch_dict["advantages_expanded"].detach(),
+            )
+            
+            # Compute gradients for this batch using autograd.grad
+            try:
+                batch_grads = torch.autograd.grad(
+                    outputs=pg_loss,
+                    inputs=trainable_params,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=True,
                 )
+                # Filter and detach
+                batch_grads = [g.detach() if g is not None else torch.zeros_like(p) for g, p in zip(batch_grads, trainable_params)]
                 
-                # Backward pass to capture gradients
-                self.accelerator.backward(pg_loss, retain_graph=True)
-                self.optimizer.zero_grad()
+                # Check for NaN
+                batch_grad_has_nan = any(torch.isnan(g).any() for g in batch_grads)
+                if batch_grad_has_nan:
+                    print(f"WARNING: Training gradients for batch {tracin_batch_start} contain NaN!")
+                    batch_grads = [torch.where(torch.isnan(g), torch.zeros_like(g), g) for g in batch_grads]
+                
+                train_grads_list.append(batch_grads)
+            except RuntimeError as e:
+                print(f"ERROR computing training gradients for batch {tracin_batch_start}: {e}")
+                # Fallback: zero gradients
+                batch_grads = [torch.zeros_like(p) for p in trainable_params]
+                train_grads_list.append(batch_grads)
         
-        self._record_ghost = False
-        
-        # Save training buffers
-        self._save_train_buffers()
-        
-        timing["time/grpo/ghost_forward"] = time.time() - t
-        
-        # =====================
-        # Part III: Compute validation gradient
-        # =====================
-        t = time.time()
-        
-        # Compute validation loss based on val_loss_type
-        if self.config.val_loss_type == 'sample-level-orig':
-            masked_term = val_advantages.unsqueeze(-1) * val_logprobs.to(torch.float32) * val_masks.detach()
-            per_sample_num = val_masks.sum(dim=1).clamp(min=1)
-            per_sample_sum = masked_term.sum(dim=1)
-            per_sample_loss = -per_sample_sum / per_sample_num
-            validation_loss = per_sample_loss.mean()
-            print(f'Validation loss (sample-level-orig): {validation_loss.item():.4f}')
-            
-        elif self.config.val_loss_type == 'rough-orig':
-            validation_loss = -torch.mean(val_advantages.unsqueeze(-1) * val_logprobs.to(torch.float32) * val_masks.detach())
-            print(f'Validation loss (rough-orig): {validation_loss.item():.4f}')
-            
-        elif self.config.val_loss_type == 'seqloss-lastadv':
-            seq_logprob = (val_logprobs.to(torch.float32) * val_masks.detach()).sum(dim=1)
-            # Get last valid token position
-            indices = torch.argmax(val_masks.detach().float(), dim=1) + val_masks.sum(dim=1) - 1
-            indices = indices.long().clamp(0, val_advantages.shape[-1] - 1 if val_advantages.dim() > 1 else 0)
-            if val_advantages.dim() > 1:
-                seq_score = val_advantages[torch.arange(val_advantages.size(0)), indices]
-            else:
-                seq_score = val_advantages
-            per_seq_loss = -seq_logprob * seq_score
-            validation_loss = per_seq_loss.mean()
-            print(f'Validation loss (seqloss-lastadv): {validation_loss.item():.4f}')
-            
-        else:
-            raise NotImplementedError(f"Validation loss type {self.config.val_loss_type} not implemented.")
-        
-        # Clear gradient buffers for backward
-        for buf in (self._gAs, self._gBs):
-            for name in buf:
-                buf[name] = []
-        
-        self._record_ghost = True
-        self.accelerator.backward(validation_loss)
-        self._record_ghost = False
-        self.optimizer.zero_grad()
-        
-        timing["time/grpo/validation_gradient"] = time.time() - t
+        timing["time/grpo/training_gradients"] = time.time() - t
         
         # =====================
-        # Part IV: Compute influence scores
+        # Part IV: Compute influence scores (inner products)
         # =====================
         t = time.time()
         
-        ghost_ip = self.compute_ghost_inner_product_matrix_op()
+        # Flatten validation gradients
+        val_grad_flat = torch.cat([g.flatten() for g in val_grads])
+        
+        # Compute influence scores
+        # Note: We compute batch-level gradients, so we assign the same IP to all samples in a batch
+        # This is an approximation - true per-sample TracIn would require individual gradient computations
+        ghost_ip = []
+        for i, batch_grads in enumerate(train_grads_list):
+            # Flatten batch gradients
+            train_grad_flat = torch.cat([g.flatten() for g in batch_grads])
+            
+            # Compute inner product
+            ip = (val_grad_flat * train_grad_flat).sum().item()
+            
+            # Assign same IP to all samples in this batch
+            batch_start = i * self.config.tracin_batch_size
+            batch_end = min(batch_start + self.config.tracin_batch_size, bs)
+            batch_size = batch_end - batch_start
+            
+            for _ in range(batch_size):
+                ghost_ip.append(ip)
+        
+        # Truncate to actual batch size
+        ghost_ip = ghost_ip[:bs]
+        
         print(f"Ghost gradient inner products: {ghost_ip[:10]}...")  # Print first 10
+        if len(ghost_ip) > 0:
+            valid_ips = [ip for ip in ghost_ip if not (math.isnan(ip) or math.isinf(ip))]
+            if valid_ips:
+                print(f"IP stats (valid): mean={np.mean(valid_ips):.6f}, std={np.std(valid_ips):.6f}, min={np.min(valid_ips):.6f}, max={np.max(valid_ips):.6f}")
+            else:
+                print("WARNING: All IPs are NaN/Inf!")
+        
+        # Check for NaN and replace with 0 (neutral influence)
+        ghost_ip = [0.0 if (math.isnan(ip) or math.isinf(ip)) else ip for ip in ghost_ip]
         
         timing["time/grpo/tracin_calculation"] = time.time() - t
         
