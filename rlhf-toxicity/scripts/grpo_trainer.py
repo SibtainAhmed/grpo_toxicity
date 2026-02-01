@@ -61,6 +61,17 @@ def ghost_mode(optimizer):
         optimizer.step = _orig_step
 
 
+def log_gpu_memory(step_name: str, verbose: bool = False):
+    """Log GPU memory usage for debugging memory leaks."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        if verbose:
+            print(f"[Memory] {step_name}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+        return allocated, reserved
+    return 0, 0
+
+
 def set_seed(seed: int):
     """Set seed for reproducibility."""
     import random
@@ -1260,6 +1271,8 @@ class GRPOTrainer:
         # Get model parameters that require gradients
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         
+        log_gpu_memory("Before validation gradients", verbose=True)
+        
         # Compute validation gradients using autograd.grad (no graph conflicts!)
         try:
             val_grads = torch.autograd.grad(
@@ -1269,8 +1282,8 @@ class GRPOTrainer:
                 create_graph=False,  # Don't build higher-order graph
                 allow_unused=True,   # Allow unused parameters (e.g., frozen layers)
             )
-            # Filter out None gradients and detach
-            val_grads = [g.detach() if g is not None else torch.zeros_like(p) for g, p in zip(val_grads, trainable_params)]
+            # Filter out None gradients, detach, and MOVE TO CPU to save GPU memory
+            val_grads = [g.detach().cpu() if g is not None else torch.zeros_like(p).cpu() for g, p in zip(val_grads, trainable_params)]
             
             # Check for NaN in validation gradients
             val_grad_has_nan = any(torch.isnan(g).any() for g in val_grads)
@@ -1280,29 +1293,44 @@ class GRPOTrainer:
                 val_grads = [torch.where(torch.isnan(g), torch.zeros_like(g), g) for g in val_grads]
         except RuntimeError as e:
             print(f"ERROR computing validation gradients: {e}")
-            # Fallback: zero gradients
-            val_grads = [torch.zeros_like(p) for p in trainable_params]
+            # Fallback: zero gradients on CPU
+            val_grads = [torch.zeros_like(p).cpu() for p in trainable_params]
+        
+        # Free validation intermediate tensors
+        del val_outputs, val_logits, val_logprobs_new, validation_loss
+        del val_model_inputs
+        torch.cuda.empty_cache()
+        
+        log_gpu_memory("After validation gradients (moved to CPU)", verbose=True)
         
         timing["time/grpo/validation_gradient"] = time.time() - t
         
         # =====================
-        # Part III: Compute training gradients per sample
+        # Part III: Compute training gradients and influence scores INLINE
+        # (Compute IP immediately and free gradients to prevent memory accumulation)
         # =====================
         t = time.time()
         
         # Store response lengths for consistent indexing
         max_response_len = logprobs.shape[1]
         
-        # Compute per-sample training gradients
-        # For efficiency, we compute gradients per TracIn batch, then approximate per-sample
-        train_grads_list = []
+        # Flatten validation gradients (on CPU) once for efficiency
+        val_grad_flat = torch.cat([g.flatten() for g in val_grads])
         
-        # Process in TracIn batches to avoid memory issues
-        for tracin_batch_start in range(0, bs, self.config.tracin_batch_size):
+        # Compute influence scores inline (compute grad, compute IP, free grad)
+        ghost_ip = []
+        
+        log_gpu_memory("Before training gradient loop", verbose=True)
+        
+        # Process in TracIn batches
+        num_batches = (bs + self.config.tracin_batch_size - 1) // self.config.tracin_batch_size
+        for batch_idx, tracin_batch_start in enumerate(range(0, bs, self.config.tracin_batch_size)):
             tracin_batch_end = min(tracin_batch_start + self.config.tracin_batch_size, bs)
             tracin_batch_inds = np.arange(tracin_batch_start, tracin_batch_end)
+            batch_size = len(tracin_batch_inds)
             
-            print(f'TracIn batch indices: {tracin_batch_inds}')
+            if batch_idx % 5 == 0:
+                print(f'TracIn batch {batch_idx+1}/{num_batches} (indices: {tracin_batch_inds[0]}-{tracin_batch_inds[-1]})')
             
             tracin_batch_dict = {
                 "logprobs": batch_dict["logprobs"][tracin_batch_inds],
@@ -1337,7 +1365,7 @@ class GRPOTrainer:
             )
             
             # Compute loss for the batch
-            pg_loss, stats = self.loss(
+            pg_loss, _ = self.loss(
                 tracin_batch_dict["logprobs"].detach(),
                 response_logits,
                 mb_logprobs_new,
@@ -1354,54 +1382,50 @@ class GRPOTrainer:
                     create_graph=False,
                     allow_unused=True,
                 )
-                # Filter and detach
-                batch_grads = [g.detach() if g is not None else torch.zeros_like(p) for g, p in zip(batch_grads, trainable_params)]
+                
+                # Flatten and compute inner product IMMEDIATELY on CPU
+                # Move to CPU for inner product to match val_grad_flat
+                train_grad_flat = torch.cat([
+                    (g.detach().cpu() if g is not None else torch.zeros_like(p).cpu()).flatten()
+                    for g, p in zip(batch_grads, trainable_params)
+                ])
                 
                 # Check for NaN
-                batch_grad_has_nan = any(torch.isnan(g).any() for g in batch_grads)
-                if batch_grad_has_nan:
+                if torch.isnan(train_grad_flat).any():
                     print(f"WARNING: Training gradients for batch {tracin_batch_start} contain NaN!")
-                    batch_grads = [torch.where(torch.isnan(g), torch.zeros_like(g), g) for g in batch_grads]
+                    train_grad_flat = torch.where(torch.isnan(train_grad_flat), torch.zeros_like(train_grad_flat), train_grad_flat)
                 
-                train_grads_list.append(batch_grads)
+                # Compute inner product
+                ip = (val_grad_flat * train_grad_flat).sum().item()
+                
+                # FREE training gradients immediately
+                del batch_grads, train_grad_flat
+                
             except RuntimeError as e:
                 print(f"ERROR computing training gradients for batch {tracin_batch_start}: {e}")
-                # Fallback: zero gradients
-                batch_grads = [torch.zeros_like(p) for p in trainable_params]
-                train_grads_list.append(batch_grads)
-        
-        timing["time/grpo/training_gradients"] = time.time() - t
-        
-        # =====================
-        # Part IV: Compute influence scores (inner products)
-        # =====================
-        t = time.time()
-        
-        # Flatten validation gradients
-        val_grad_flat = torch.cat([g.flatten() for g in val_grads])
-        
-        # Compute influence scores
-        # Note: We compute batch-level gradients, so we assign the same IP to all samples in a batch
-        # This is an approximation - true per-sample TracIn would require individual gradient computations
-        ghost_ip = []
-        for i, batch_grads in enumerate(train_grads_list):
-            # Flatten batch gradients
-            train_grad_flat = torch.cat([g.flatten() for g in batch_grads])
-            
-            # Compute inner product
-            ip = (val_grad_flat * train_grad_flat).sum().item()
+                ip = 0.0  # Neutral influence on error
             
             # Assign same IP to all samples in this batch
-            batch_start = i * self.config.tracin_batch_size
-            batch_end = min(batch_start + self.config.tracin_batch_size, bs)
-            batch_size = batch_end - batch_start
-            
             for _ in range(batch_size):
                 ghost_ip.append(ip)
+            
+            # FREE forward pass tensors
+            del outputs, logits, mb_logprobs_new, response_logits, pg_loss
+            del tracin_batch_dict, mb_model_inputs
+            
+            # Periodic cache clear to prevent fragmentation
+            if batch_idx % 5 == 0:
+                torch.cuda.empty_cache()
         
-        # Truncate to actual batch size
-        ghost_ip = ghost_ip[:bs]
+        # Final cleanup of validation gradients
+        del val_grads, val_grad_flat
+        torch.cuda.empty_cache()
         
+        log_gpu_memory("After training gradient loop", verbose=True)
+        
+        timing["time/grpo/tracin_calculation"] = time.time() - t
+        
+        # Log influence score statistics
         print(f"Ghost gradient inner products: {ghost_ip[:10]}...")  # Print first 10
         if len(ghost_ip) > 0:
             valid_ips = [ip for ip in ghost_ip if not (math.isnan(ip) or math.isinf(ip))]
@@ -1412,8 +1436,6 @@ class GRPOTrainer:
         
         # Check for NaN and replace with 0 (neutral influence)
         ghost_ip = [0.0 if (math.isnan(ip) or math.isinf(ip)) else ip for ip in ghost_ip]
-        
-        timing["time/grpo/tracin_calculation"] = time.time() - t
         
         # =====================
         # Part V: Select samples with positive influence and train
@@ -1558,6 +1580,17 @@ class GRPOTrainer:
         stats["tracin/std_ip"] = np.std(ghost_ip)
         stats.update(timing)
         stats["time/grpo/total"] = time.time() - t0
+        
+        # =====================
+        # Final memory cleanup
+        # =====================
+        # Delete batch_dict and intermediate tensors
+        del batch_dict
+        del logprobs, ref_logprobs, masks, rewards, advantages, advantages_expanded
+        del scores_tensor, model_inputs
+        torch.cuda.empty_cache()
+        
+        log_gpu_memory("End of step_tracin", verbose=True)
         
         return stats, ghost_ip
 
