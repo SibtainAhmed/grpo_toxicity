@@ -507,17 +507,18 @@ class GRPOTrainer:
                 # Reshape for batch matmul: [N_val, S_val, r, 1] @ [N_val, S_val, 1, d_in]
                 # g_A: [N_val, S_val, r] → [N_val*S_val, r, 1]
                 # x:   [N_val, S_val, d_in] → [N_val*S_val, 1, d_in]
-                val_gA_reshaped = val_GAt.reshape(-1, r, 1)       # [N_val*S_val, r, 1]
-                val_x_reshaped = val_X.reshape(-1, 1, d_in)       # [N_val*S_val, 1, d_in]
+                # Convert to float32 for numerical stability in mixed precision
+                val_gA_reshaped = val_GAt.float().reshape(-1, r, 1)       # [N_val*S_val, r, 1]
+                val_x_reshaped = val_X.float().reshape(-1, 1, d_in)       # [N_val*S_val, 1, d_in]
                 val_grad_A = (val_gA_reshaped @ val_x_reshaped).sum(dim=0)  # [r, d_in]
                 
-                val_gB_reshaped = val_GBt.reshape(-1, d_out, 1)   # [N_val*S_val, d_out, 1]
-                val_h_reshaped = val_H.reshape(-1, 1, r)          # [N_val*S_val, 1, r]
+                val_gB_reshaped = val_GBt.float().reshape(-1, d_out, 1)   # [N_val*S_val, d_out, 1]
+                val_h_reshaped = val_H.float().reshape(-1, 1, r)          # [N_val*S_val, 1, r]
                 val_grad_B = (val_gB_reshaped @ val_h_reshaped).sum(dim=0)  # [d_out, r]
             else:
                 # Fallback: simple sum of gradients
-                val_grad_A = val_GAt.sum(dim=(0, 1)).unsqueeze(1) @ train_X.mean(dim=(0, 1)).unsqueeze(0)
-                val_grad_B = val_GBt.sum(dim=(0, 1)).unsqueeze(1) @ train_H.mean(dim=(0, 1)).unsqueeze(0)
+                val_grad_A = val_GAt.float().sum(dim=(0, 1)).unsqueeze(1) @ train_X.float().mean(dim=(0, 1)).unsqueeze(0)
+                val_grad_B = val_GBt.float().sum(dim=(0, 1)).unsqueeze(1) @ train_H.float().mean(dim=(0, 1)).unsqueeze(0)
             
             # Flatten validation gradients
             val_grad_A_flat = val_grad_A.flatten()  # [r * d_in]
@@ -545,8 +546,9 @@ class GRPOTrainer:
                 # Compute per-sample gradients using einsum
                 # grad_W_A[i] = sum_s g_A[i,s,:].T @ x[i,s,:] = einsum('sr,sd->rd', gA[i], x[i])
                 # For batch: einsum('nsr,nsd->nrd', chunk_gA, chunk_x)
-                train_grad_A = torch.einsum('nsr,nsd->nrd', chunk_gA, chunk_x)  # [chunk_N, r, d_in]
-                train_grad_B = torch.einsum('nso,nsr->nor', chunk_gB, chunk_h)  # [chunk_N, d_out, r]
+                # Convert to float32 for numerical stability in mixed precision
+                train_grad_A = torch.einsum('nsr,nsd->nrd', chunk_gA.float(), chunk_x.float())  # [chunk_N, r, d_in]
+                train_grad_B = torch.einsum('nso,nsr->nor', chunk_gB.float(), chunk_h.float())  # [chunk_N, d_out, r]
                 
                 # Flatten per sample: [chunk_N, r*d_in] and [chunk_N, d_out*r]
                 train_grad_A_flat = train_grad_A.view(chunk_N, -1)
