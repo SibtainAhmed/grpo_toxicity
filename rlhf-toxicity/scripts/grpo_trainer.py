@@ -1109,12 +1109,17 @@ class GRPOTrainer:
         """
         Run a GRPO optimization step with TracIn influence-based sample selection.
         
+        Uses HOOK-BASED gradient capture (like PPO) instead of torch.autograd.grad().
+        This is much more memory-efficient as it reuses existing computational graphs.
+        
         This method:
-        1. Computes ghost gradients for training samples
-        2. Computes validation gradient
-        3. Computes influence scores (gradient inner products)
-        4. Selects samples with positive influence
-        5. Trains only on selected samples
+        1. Captures training gradients via hooks during forward+backward with ghost_mode
+        2. Saves training gradient buffers
+        3. Clears validation gradient buffers
+        4. Captures validation gradients via hooks during forward+backward
+        5. Computes influence scores using efficient matrix operations
+        6. Selects samples with positive influence
+        7. Trains only on selected samples
         
         Args:
             queries: List of query tensors
@@ -1137,7 +1142,7 @@ class GRPOTrainer:
         bs = len(queries)
         
         # =====================
-        # Part I: Compute forward pass and ghost gradients for training data
+        # Part I: Prepare inputs and compute forward pass
         # =====================
         
         # Prepare model inputs
@@ -1146,13 +1151,16 @@ class GRPOTrainer:
         model_inputs_names = list(model_inputs.keys())
         timing["time/grpo/prepare_inputs"] = time.time() - t
         
-        # Put model in eval mode for gradient computation
+        # Put model in eval mode for gradient computation (disable dropout)
         self.model.eval()
         for module in self.model.modules():
             if isinstance(module, torch.nn.Dropout):
                 module.eval()
         
-        # Forward pass with ghost recording enabled
+        # Clear ghost buffers before starting
+        self._clear_ghost_buffers()
+        
+        # Forward pass with ghost recording enabled (captures activations for training)
         t = time.time()
         self._record_ghost = True
         logprobs, masks = self.compute_logprobs(self.model, queries, responses, model_inputs)
@@ -1197,168 +1205,23 @@ class GRPOTrainer:
         }
         batch_dict.update(model_inputs)
         
-        # =====================
-        # Part II: Compute validation gradient FIRST (cleaner graph)
-        # =====================
-        t = time.time()
-        
-        # Ensure model is in eval mode for validation
-        self.model.eval()
-        for module in self.model.modules():
-            if isinstance(module, torch.nn.Dropout):
-                module.eval()
-        
-        # Prepare validation model inputs
-        val_model_inputs = self.prepare_model_inputs(val_queries, val_responses)
-        
-        # Forward pass on validation set
-        val_outputs = self.model(
-            input_ids=val_model_inputs["input_ids"],
-            attention_mask=val_model_inputs["attention_mask"],
-        )
-        val_logits = val_outputs.logits
-        
-        # Recompute validation logprobs (needed for gradient computation)
-        val_logprobs_new = self._compute_logprobs_consistent(
-            val_logits, val_queries, val_responses, val_model_inputs, val_logprobs.shape[1]
-        )
-        
-        # Compute validation loss based on val_loss_type
-        print(f"\n=== Validation Loss Debug ===")
-        print(f"val_logprobs shape: {val_logprobs.shape}, val_masks shape: {val_masks.shape}")
-        print(f"val_advantages shape: {val_advantages.shape}")
-        print(f"val_logprobs contains NaN: {torch.isnan(val_logprobs).any()}")
-        print(f"val_advantages contains NaN: {torch.isnan(val_advantages).any()}")
-        print(f"val_masks sum: {val_masks.sum()}")
-        
-        if self.config.val_loss_type == 'sample-level-orig':
-            # val_advantages is 1D [B], expand to match logprobs
-            val_adv_expanded = val_advantages.unsqueeze(-1)  # [B, 1]
-            masked_term = val_adv_expanded * val_logprobs_new.to(torch.float32) * val_masks.detach()
-            per_sample_num = val_masks.sum(dim=1).clamp(min=1)
-            per_sample_sum = masked_term.sum(dim=1)
-            per_sample_loss = -per_sample_sum / per_sample_num
-            validation_loss = per_sample_loss.mean()
-            print(f'Validation loss (sample-level-orig): {validation_loss.item():.4f}')
-            
-        elif self.config.val_loss_type == 'rough-orig':
-            val_adv_expanded = val_advantages.unsqueeze(-1)  # [B, 1]
-            validation_loss = -torch.mean(val_adv_expanded * val_logprobs_new.to(torch.float32) * val_masks.detach())
-            print(f'Validation loss (rough-orig): {validation_loss.item():.4f}')
-            
-        elif self.config.val_loss_type == 'seqloss-lastadv':
-            # Sequence-level loss: sum of logprobs * last advantage
-            seq_logprob = (val_logprobs_new.to(torch.float32) * val_masks.detach()).sum(dim=1)  # [B]
-            
-            # Get last valid token position for each sequence
-            # val_masks is [B, S], find last True position
-            seq_lengths = val_masks.sum(dim=1).long()  # [B] - number of valid tokens per sequence
-            max_len = val_masks.shape[1]
-            
-            # For each sequence, get the advantage at the last position
-            # val_advantages is 1D [B] (one advantage per sequence)
-            seq_score = val_advantages  # Already per-sequence
-            
-            per_seq_loss = -seq_logprob * seq_score  # [B]
-            validation_loss = per_seq_loss.mean()
-            print(f'Validation loss (seqloss-lastadv): {validation_loss.item():.4f}')
-            print(f'  seq_logprob range: [{seq_logprob.min():.4f}, {seq_logprob.max():.4f}]')
-            print(f'  seq_score range: [{seq_score.min():.4f}, {seq_score.max():.4f}]')
-            
-        else:
-            raise NotImplementedError(f"Validation loss type {self.config.val_loss_type} not implemented.")
-        
-        # Check for NaN
-        if torch.isnan(validation_loss) or torch.isinf(validation_loss):
-            print(f"ERROR: Validation loss is NaN/Inf! Using fallback loss.")
-            # Fallback: simple mean of logprobs
-            validation_loss = -torch.mean(val_logprobs_new.to(torch.float32) * val_masks.detach())
-            print(f'  Fallback validation loss: {validation_loss.item():.4f}')
-        
-        print(f"Validation loss final: {validation_loss.item():.4f}")
-        print(f"Validation loss requires_grad: {validation_loss.requires_grad}")
-        print(f"Validation loss grad_fn: {validation_loss.grad_fn}")
-        
-        # Debug: Check if val_advantages is all zeros (would cause zero gradients)
-        if (val_advantages == 0).all():
-            print("WARNING: val_advantages is ALL ZEROS - this will cause zero gradients!")
-        print(f"================================\n")
-        
-        # Get model parameters that require gradients
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        num_trainable = len(trainable_params)
-        print(f"Number of trainable parameters: {num_trainable}")
-        
-        log_gpu_memory("Before validation gradients", verbose=True)
-        
-        # Compute validation gradients using autograd.grad (no graph conflicts!)
-        try:
-            val_grads = torch.autograd.grad(
-                outputs=validation_loss,
-                inputs=trainable_params,
-                retain_graph=False,  # Don't keep graph
-                create_graph=False,  # Don't build higher-order graph
-                allow_unused=True,   # Allow unused parameters (e.g., frozen layers)
-            )
-            
-            # Filter out None gradients, detach, clone, and MOVE TO CPU
-            val_grads = [g.detach().clone().cpu() if g is not None else torch.zeros_like(p).cpu() for g, p in zip(val_grads, trainable_params)]
-            
-            # DEBUG: Check validation gradient norms
-            non_zero_grads = [(i, g.norm().item()) for i, g in enumerate(val_grads) if g.norm().item() > 0]
-            print(f"Validation gradients: {len(non_zero_grads)} non-zero out of {len(val_grads)}")
-            if non_zero_grads:
-                print(f"  First 5 non-zero grad norms: {[norm for _, norm in non_zero_grads[:5]]}")
-            else:
-                print("  WARNING: ALL validation gradients are ZERO!")
-            
-            # Check for NaN in validation gradients
-            val_grad_has_nan = any(torch.isnan(g).any() for g in val_grads)
-            if val_grad_has_nan:
-                print("WARNING: Validation gradients contain NaN!")
-                val_grads = [torch.where(torch.isnan(g), torch.zeros_like(g), g) for g in val_grads]
-        except RuntimeError as e:
-            print(f"ERROR computing validation gradients: {e}")
-            val_grads = [torch.zeros_like(p).cpu() for p in trainable_params]
-        
-        # Free validation intermediate tensors AGGRESSIVELY
-        del val_outputs, val_logits, val_logprobs_new, validation_loss
-        del val_model_inputs
-        
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
-        
-        log_gpu_memory("After validation gradients (moved to CPU)", verbose=True)
-        
-        timing["time/grpo/validation_gradient"] = time.time() - t
-        
-        # =====================
-        # Part III: Compute training gradients and influence scores INLINE
-        # (Compute IP immediately and free gradients to prevent memory accumulation)
-        # =====================
-        t = time.time()
-        
         # Store response lengths for consistent indexing
         max_response_len = logprobs.shape[1]
         
-        # Flatten validation gradients (on CPU) once for efficiency
-        val_grad_flat = torch.cat([g.flatten() for g in val_grads])
+        # =====================
+        # Part II: Capture TRAINING gradients via hooks (PPO-style)
+        # =====================
+        t = time.time()
+        log_gpu_memory("Before training gradient capture", verbose=True)
         
-        # Compute influence scores inline (compute grad, compute IP, free grad)
-        ghost_ip = []
+        # Clear ghost buffers and start recording
+        self._clear_ghost_buffers()
+        self._record_ghost = True
         
-        log_gpu_memory("Before training gradient loop", verbose=True)
-        
-        # Process in TracIn batches
-        num_batches = (bs + self.config.tracin_batch_size - 1) // self.config.tracin_batch_size
-        for batch_idx, tracin_batch_start in enumerate(range(0, bs, self.config.tracin_batch_size)):
+        # Process training samples in batches with ghost_mode (no weight updates)
+        for tracin_batch_start in range(0, bs, self.config.tracin_batch_size):
             tracin_batch_end = min(tracin_batch_start + self.config.tracin_batch_size, bs)
             tracin_batch_inds = np.arange(tracin_batch_start, tracin_batch_end)
-            batch_size = len(tracin_batch_inds)
-            
-            if batch_idx % 5 == 0:
-                print(f'TracIn batch {batch_idx+1}/{num_batches} (indices: {tracin_batch_inds[0]}-{tracin_batch_inds[-1]})')
             
             tracin_batch_dict = {
                 "logprobs": batch_dict["logprobs"][tracin_batch_inds],
@@ -1373,7 +1236,7 @@ class GRPOTrainer:
             
             mb_model_inputs = {k: tracin_batch_dict[k] for k in model_inputs_names}
             
-            # Forward pass
+            # Forward pass (hooks capture activations)
             outputs = self.model(
                 input_ids=mb_model_inputs["input_ids"],
                 attention_mask=mb_model_inputs["attention_mask"],
@@ -1401,73 +1264,104 @@ class GRPOTrainer:
                 tracin_batch_dict["advantages_expanded"].detach(),
             )
             
-            # Compute gradients for this batch using autograd.grad
-            try:
-                batch_grads = torch.autograd.grad(
-                    outputs=pg_loss,
-                    inputs=trainable_params,
-                    retain_graph=False,
-                    create_graph=False,
-                    allow_unused=True,
-                )
-                
-                # Flatten and compute inner product IMMEDIATELY on CPU
-                train_grad_flat = torch.cat([
-                    (g.detach().clone().cpu() if g is not None else torch.zeros_like(p).cpu()).flatten()
-                    for g, p in zip(batch_grads, trainable_params)
-                ])
-                
-                # DEBUG: First batch - check training gradient norms
-                if batch_idx == 0:
-                    train_grad_norm = train_grad_flat.norm().item()
-                    val_grad_norm = val_grad_flat.norm().item()
-                    print(f"DEBUG: Train grad norm: {train_grad_norm:.6f}, Val grad norm: {val_grad_norm:.6f}")
-                    non_zero_train = (train_grad_flat != 0).sum().item()
-                    print(f"DEBUG: Train non-zero elements: {non_zero_train} / {train_grad_flat.numel()}")
-                
-                # Check for NaN
-                if torch.isnan(train_grad_flat).any():
-                    print(f"WARNING: Training gradients for batch {tracin_batch_start} contain NaN!")
-                    train_grad_flat = torch.where(torch.isnan(train_grad_flat), torch.zeros_like(train_grad_flat), train_grad_flat)
-                
-                # Compute inner product
-                ip = (val_grad_flat * train_grad_flat).sum().item()
-                
-                # DEBUG: First batch - print inner product details
-                if batch_idx == 0:
-                    print(f"DEBUG: Inner product result: {ip:.10f}")
-                
-                # FREE training gradients immediately
-                del batch_grads, train_grad_flat
-                
-            except RuntimeError as e:
-                print(f"ERROR computing training gradients for batch {tracin_batch_start}: {e}")
-                ip = 0.0  # Neutral influence on error
+            # Backward with ghost_mode (captures gradients via hooks but doesn't update weights)
+            with ghost_mode(self.optimizer):
+                self.accelerator.backward(pg_loss, retain_graph=False)
+                self.optimizer.zero_grad()
+        
+        self._record_ghost = False
+        
+        # Save training gradient buffers
+        self._save_train_buffers()
+        
+        timing["time/grpo/train_gradient_capture"] = time.time() - t
+        log_gpu_memory("After training gradient capture", verbose=True)
+        
+        # =====================
+        # Part III: Capture VALIDATION gradients via hooks (PPO-style)
+        # =====================
+        t = time.time()
+        
+        # Clear gradient buffers for validation (keep _train_* buffers)
+        for buf in (self._gAs, self._gBs):
+            for name in buf:
+                buf[name] = []
+        
+        # Prepare validation model inputs
+        val_model_inputs = self.prepare_model_inputs(val_queries, val_responses)
+        
+        # Forward pass on validation set with ghost recording
+        self._record_ghost = True
+        val_outputs = self.model(
+            input_ids=val_model_inputs["input_ids"],
+            attention_mask=val_model_inputs["attention_mask"],
+        )
+        val_logits = val_outputs.logits
+        
+        # Recompute validation logprobs
+        val_logprobs_new = self._compute_logprobs_consistent(
+            val_logits, val_queries, val_responses, val_model_inputs, val_logprobs.shape[1]
+        )
+        
+        # Compute validation loss based on val_loss_type
+        print(f"\n=== Validation Loss Debug ===")
+        print(f"val_logprobs shape: {val_logprobs.shape}, val_masks shape: {val_masks.shape}")
+        print(f"val_advantages shape: {val_advantages.shape}")
+        
+        if self.config.val_loss_type == 'sample-level-orig':
+            val_adv_expanded = val_advantages.unsqueeze(-1)
+            masked_term = val_adv_expanded * val_logprobs_new.to(torch.float32) * val_masks.detach()
+            per_sample_num = val_masks.sum(dim=1).clamp(min=1)
+            per_sample_sum = masked_term.sum(dim=1)
+            per_sample_loss = -per_sample_sum / per_sample_num
+            validation_loss = per_sample_loss.mean()
+            print(f'Validation loss (sample-level-orig): {validation_loss.item():.4f}')
             
-            # Assign same IP to all samples in this batch
-            for _ in range(batch_size):
-                ghost_ip.append(ip)
+        elif self.config.val_loss_type == 'rough-orig':
+            val_adv_expanded = val_advantages.unsqueeze(-1)
+            validation_loss = -torch.mean(val_adv_expanded * val_logprobs_new.to(torch.float32) * val_masks.detach())
+            print(f'Validation loss (rough-orig): {validation_loss.item():.4f}')
             
-            # FREE forward pass tensors AGGRESSIVELY
-            del outputs, logits, mb_logprobs_new, response_logits, pg_loss
-            del tracin_batch_dict, mb_model_inputs
+        elif self.config.val_loss_type == 'seqloss-lastadv':
+            seq_logprob = (val_logprobs_new.to(torch.float32) * val_masks.detach()).sum(dim=1)
+            seq_score = val_advantages
+            per_seq_loss = -seq_logprob * seq_score
+            validation_loss = per_seq_loss.mean()
+            print(f'Validation loss (seqloss-lastadv): {validation_loss.item():.4f}')
+            print(f'  seq_logprob range: [{seq_logprob.min():.4f}, {seq_logprob.max():.4f}]')
+            print(f'  seq_score range: [{seq_score.min():.4f}, {seq_score.max():.4f}]')
             
-            # More frequent cache clearing to prevent memory accumulation
-            if batch_idx % 2 == 0:
-                gc.collect()
-                torch.cuda.empty_cache()
+        else:
+            raise NotImplementedError(f"Validation loss type {self.config.val_loss_type} not implemented.")
         
-        # Final cleanup of validation gradients
-        del val_grads, val_grad_flat
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Check for NaN
+        if torch.isnan(validation_loss) or torch.isinf(validation_loss):
+            print(f"ERROR: Validation loss is NaN/Inf! Using fallback loss.")
+            validation_loss = -torch.mean(val_logprobs_new.to(torch.float32) * val_masks.detach())
         
-        log_gpu_memory("After training gradient loop", verbose=True)
+        print(f"Validation loss final: {validation_loss.item():.4f}")
+        print(f"================================\n")
         
-        timing["time/grpo/tracin_calculation"] = time.time() - t
+        # Backward on validation loss (captures validation gradients via hooks)
+        self.accelerator.backward(validation_loss)
+        self.optimizer.zero_grad()
+        self._record_ghost = False
         
-        # Log influence score statistics
-        print(f"Ghost gradient inner products: {ghost_ip[:10]}...")  # Print first 10
+        # Free validation tensors
+        del val_outputs, val_logits, val_logprobs_new, validation_loss, val_model_inputs
+        
+        timing["time/grpo/validation_gradient"] = time.time() - t
+        log_gpu_memory("After validation gradient capture", verbose=True)
+        
+        # =====================
+        # Part IV: Compute influence scores using efficient matrix operations
+        # =====================
+        t = time.time()
+        
+        # Compute ghost inner products using matrix operations (like PPO)
+        ghost_ip = self.compute_ghost_inner_product_matrix_op()
+        
+        print(f"Ghost gradient inner products: {ghost_ip[:10]}...")
         if len(ghost_ip) > 0:
             valid_ips = [ip for ip in ghost_ip if not (math.isnan(ip) or math.isinf(ip))]
             if valid_ips:
@@ -1475,8 +1369,22 @@ class GRPOTrainer:
             else:
                 print("WARNING: All IPs are NaN/Inf!")
         
-        # Check for NaN and replace with 0 (neutral influence)
+        # Check for NaN and replace with 0
         ghost_ip = [0.0 if (math.isnan(ip) or math.isinf(ip)) else ip for ip in ghost_ip]
+        
+        timing["time/grpo/tracin_calculation"] = time.time() - t
+        
+        # Clear ghost buffers to free memory
+        self._clear_ghost_buffers()
+        for buf in (self._train_xs, self._train_hs, self._train_gAs, self._train_gBs):
+            for name in list(buf.keys()):
+                buf[name] = []
+        
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        log_gpu_memory("After TracIn calculation (buffers cleared)", verbose=True)
         
         # =====================
         # Part V: Select samples with positive influence and train
