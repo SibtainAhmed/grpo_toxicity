@@ -453,14 +453,11 @@ class GRPOTrainer:
         """
         Compute TracIn influence scores for GRPO with separate validation data.
         
-        The TracIn influence score is: IP[i] = <grad_train[i], grad_valid>
+        For LoRA layers, the gradient w.r.t. weight W_A [r, d_in] is:
+            grad_W_A = sum_over_seq( g_A.T @ x )  → [r, d_in]
         
-        For LoRA, grad_W = outer(g, x), so:
-        IP = sum_layers( sum_over_seq( (gA_train ⊙ gA_valid) * (x_train ⊙ x_valid) ) )
-        
-        Since training and validation have different data:
-        - Aggregate validation gradients into one direction
-        - Compute each training sample's alignment with that direction
+        This properly aggregates over the sequence dimension, making it independent
+        of sequence length (training and validation can have different lengths).
         
         Returns per-training-sample inner products with aggregated validation gradient.
         """
@@ -481,66 +478,85 @@ class GRPOTrainer:
             if len(self._train_xs.get(name, [])) == 0 or len(self._gAs.get(name, [])) == 0:
                 continue
             
-            # Training data: [N_train, S, dim]
-            train_X = torch.cat(self._train_xs[name], dim=0)    # [N_train, S, d_in]
-            train_H = torch.cat(self._train_hs[name], dim=0)    # [N_train, S, r]
-            train_GAt = torch.cat(self._train_gAs[name], dim=0) # [N_train, S, r]
-            train_GBt = torch.cat(self._train_gBs[name], dim=0) # [N_train, S, d_out]
+            # Training data: [N_train, S_train, dim]
+            train_X = torch.cat(self._train_xs[name], dim=0)    # [N_train, S_train, d_in]
+            train_H = torch.cat(self._train_hs[name], dim=0)    # [N_train, S_train, r]
+            train_GAt = torch.cat(self._train_gAs[name], dim=0) # [N_train, S_train, r]
+            train_GBt = torch.cat(self._train_gBs[name], dim=0) # [N_train, S_train, d_out]
             
-            # Validation gradients: [N_val, S, dim]
-            val_GAt = torch.cat(self._gAs[name], dim=0)  # [N_val, S, r]
-            val_GBt = torch.cat(self._gBs[name], dim=0)  # [N_val, S, d_out]
-            
-            # Also need validation activations (captured in _xs, _hs during validation forward)
+            # Validation data: [N_val, S_val, dim] - may have different sequence length!
             val_X = torch.cat(self._xs[name], dim=0) if len(self._xs[name]) > 0 else None
             val_H = torch.cat(self._hs[name], dim=0) if len(self._hs[name]) > 0 else None
+            val_GAt = torch.cat(self._gAs[name], dim=0)  # [N_val, S_val, r]
+            val_GBt = torch.cat(self._gBs[name], dim=0)  # [N_val, S_val, d_out]
             
             N_train = train_X.shape[0]
+            N_val = val_GAt.shape[0]
             
-            # For LoRA gradient: grad_W_A = gA ⊗ x, grad_W_B = gB ⊗ h
-            # The full gradient is: [gA[0]*x[0], gA[1]*x[1], ..., gA[S]*x[S]] flattened
-            # Inner product: sum over all positions of (gA_train * gA_valid) * (x_train * x_valid)
+            # Get dimensions
+            r = train_GAt.shape[2]      # LoRA rank
+            d_in = train_X.shape[2]     # Input dimension to lora_A
+            d_out = train_GBt.shape[2]  # Output dimension from lora_B
             
-            # Flatten: [N, S*r] and [N, S*d_in]
-            train_GAt_flat = train_GAt.view(N_train, -1)  # [N_train, S*r]
-            train_GBt_flat = train_GBt.view(N_train, -1)  # [N_train, S*d_out]
-            train_X_flat = train_X.view(N_train, -1)      # [N_train, S*d_in]
-            train_H_flat = train_H.view(N_train, -1)      # [N_train, S*r]
+            # =====================
+            # Compute validation gradient (aggregated over all validation samples)
+            # grad_W_A = sum_i sum_s (g_A[i,s,:].T @ x[i,s,:]) → [r, d_in]
+            # =====================
             
-            # Aggregate validation gradients: sum over validation samples, then flatten
-            val_gA_agg = val_GAt.sum(dim=0).flatten()  # [S*r]
-            val_gB_agg = val_GBt.sum(dim=0).flatten()  # [S*d_out]
-            
-            # Aggregate validation activations if available
             if val_X is not None:
-                val_X_agg = val_X.mean(dim=0).flatten()  # [S*d_in] - use mean for activation
-                val_H_agg = val_H.mean(dim=0).flatten()  # [S*r]
+                # Reshape for batch matmul: [N_val, S_val, r, 1] @ [N_val, S_val, 1, d_in]
+                # g_A: [N_val, S_val, r] → [N_val*S_val, r, 1]
+                # x:   [N_val, S_val, d_in] → [N_val*S_val, 1, d_in]
+                val_gA_reshaped = val_GAt.reshape(-1, r, 1)       # [N_val*S_val, r, 1]
+                val_x_reshaped = val_X.reshape(-1, 1, d_in)       # [N_val*S_val, 1, d_in]
+                val_grad_A = (val_gA_reshaped @ val_x_reshaped).sum(dim=0)  # [r, d_in]
+                
+                val_gB_reshaped = val_GBt.reshape(-1, d_out, 1)   # [N_val*S_val, d_out, 1]
+                val_h_reshaped = val_H.reshape(-1, 1, r)          # [N_val*S_val, 1, r]
+                val_grad_B = (val_gB_reshaped @ val_h_reshaped).sum(dim=0)  # [d_out, r]
             else:
-                # Fallback: use training activation mean as proxy
-                val_X_agg = train_X_flat.mean(dim=0)
-                val_H_agg = train_H_flat.mean(dim=0)
+                # Fallback: simple sum of gradients
+                val_grad_A = val_GAt.sum(dim=(0, 1)).unsqueeze(1) @ train_X.mean(dim=(0, 1)).unsqueeze(0)
+                val_grad_B = val_GBt.sum(dim=(0, 1)).unsqueeze(1) @ train_H.mean(dim=(0, 1)).unsqueeze(0)
             
-            # For each training sample, compute gradient inner product
-            # IP[i] = sum_pos( (gA_train[i] * gA_valid) * (x_train[i] * x_valid) )
-            #       + sum_pos( (gB_train[i] * gB_valid) * (h_train[i] * h_valid) )
+            # Flatten validation gradients
+            val_grad_A_flat = val_grad_A.flatten()  # [r * d_in]
+            val_grad_B_flat = val_grad_B.flatten()  # [d_out * r]
             
-            # Block A: element-wise product, then sum
-            # (train_GAt_flat * val_gA_agg): [N_train, S*r]
-            # (train_X_flat * val_X_agg): [N_train, S*d_in]
-            # We need to sum corresponding elements (same sequence position)
+            # =====================
+            # Compute training gradients (per sample)
+            # For each training sample i: grad_W_A[i] = sum_s (g_A[i,s,:].T @ x[i,s,:])
+            # =====================
             
-            # Simpler approximation: 
-            # IP_A[i] = <train_gA[i], val_gA> * <train_x[i], val_x>
-            gA_dot = (train_GAt_flat * val_gA_agg.unsqueeze(0)).sum(dim=1)  # [N_train]
-            x_dot = (train_X_flat * val_X_agg.unsqueeze(0)).sum(dim=1)       # [N_train]
-            block_A = gA_dot * x_dot.sign() * (x_dot.abs() + 1e-8).sqrt()    # Scale by activation alignment
-            
-            # Block B
-            gB_dot = (train_GBt_flat * val_gB_agg.unsqueeze(0)).sum(dim=1)  # [N_train]
-            h_dot = (train_H_flat * val_H_agg.unsqueeze(0)).sum(dim=1)       # [N_train]
-            block_B = gB_dot * h_dot.sign() * (h_dot.abs() + 1e-8).sqrt()
-            
-            sample_IP[:N_train] += block_A + block_B
+            # Process in smaller chunks to avoid memory issues
+            chunk_size = min(16, N_train)
+            for chunk_start in range(0, N_train, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, N_train)
+                chunk_N = chunk_end - chunk_start
+                
+                # Get chunk data
+                chunk_gA = train_GAt[chunk_start:chunk_end]  # [chunk_N, S, r]
+                chunk_x = train_X[chunk_start:chunk_end]     # [chunk_N, S, d_in]
+                chunk_gB = train_GBt[chunk_start:chunk_end]  # [chunk_N, S, d_out]
+                chunk_h = train_H[chunk_start:chunk_end]     # [chunk_N, S, r]
+                
+                S_train = chunk_gA.shape[1]
+                
+                # Compute per-sample gradients using einsum
+                # grad_W_A[i] = sum_s g_A[i,s,:].T @ x[i,s,:] = einsum('sr,sd->rd', gA[i], x[i])
+                # For batch: einsum('nsr,nsd->nrd', chunk_gA, chunk_x)
+                train_grad_A = torch.einsum('nsr,nsd->nrd', chunk_gA, chunk_x)  # [chunk_N, r, d_in]
+                train_grad_B = torch.einsum('nso,nsr->nor', chunk_gB, chunk_h)  # [chunk_N, d_out, r]
+                
+                # Flatten per sample: [chunk_N, r*d_in] and [chunk_N, d_out*r]
+                train_grad_A_flat = train_grad_A.view(chunk_N, -1)
+                train_grad_B_flat = train_grad_B.view(chunk_N, -1)
+                
+                # Compute inner products with validation gradient
+                ip_A = (train_grad_A_flat * val_grad_A_flat.unsqueeze(0)).sum(dim=1)  # [chunk_N]
+                ip_B = (train_grad_B_flat * val_grad_B_flat.unsqueeze(0)).sum(dim=1)  # [chunk_N]
+                
+                sample_IP[chunk_start:chunk_end] += ip_A + ip_B
         
         # Pad to batch_size if needed
         result = sample_IP.cpu().numpy().tolist()
