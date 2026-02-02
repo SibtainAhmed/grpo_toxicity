@@ -231,8 +231,12 @@ def get_reward_scores(reward_model, reward_tokenizer, texts, device):
         # This gives rewards in range ~2 to ~5, matching PPO scale
         logits = outputs.logits.float()
         scores = logits[:, 0]  # "nothate" logit
+        scores_list = scores.cpu().tolist()
     
-    return scores.cpu().tolist()
+    # FREE reward model intermediate tensors
+    del inputs, outputs, logits, scores
+    
+    return scores_list
 
 
 def grpo_train_loop(
@@ -447,6 +451,12 @@ def grpo_train_loop_with_validation(
     )
     val_scores_tensor = torch.tensor(val_scores, device=device, dtype=torch.float32)
     
+    # FREE temporary tensors used during initial validation setup
+    del val_response_texts, val_query_texts, val_full_texts, val_scores
+    del val_model_inputs, val_sample_indices
+    gc.collect()
+    torch.cuda.empty_cache()
+    
     # Handle NaN in validation scores
     if torch.isnan(val_scores_tensor).any():
         print("WARNING: Validation scores contain NaN! Replacing with 0.")
@@ -476,6 +486,16 @@ def grpo_train_loop_with_validation(
         # Periodically regenerate validation responses for diversity
         if epoch % val_regenerate_freq == 0:
             print(f"\n[Step {epoch}] Regenerating validation responses...")
+            
+            # FREE old validation tensors BEFORE creating new ones
+            try:
+                del val_responses_batch, val_logprobs, val_masks, val_advantages
+                del val_queries_batch, val_scores_tensor
+            except NameError:
+                pass  # First iteration or already deleted
+            gc.collect()
+            torch.cuda.empty_cache()
+            
             val_sample_indices = torch.randperm(len(val_question_tensors))[:val_sample_size]
             val_queries_batch = [val_question_tensors[idx].to(device) for idx in val_sample_indices]
             
@@ -497,6 +517,12 @@ def grpo_train_loop_with_validation(
                 grpo_trainer.model, val_queries_batch, val_responses_batch, val_model_inputs
             )
             val_scores_tensor = torch.tensor(val_scores, device=device, dtype=torch.float32)
+            
+            # FREE temporary tensors used during regeneration
+            del val_response_texts, val_query_texts, val_full_texts, val_scores
+            del val_model_inputs, val_sample_indices
+            gc.collect()
+            torch.cuda.empty_cache()
             
             # Handle NaN in validation scores
             if torch.isnan(val_scores_tensor).any():
