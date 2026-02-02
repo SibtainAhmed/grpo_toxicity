@@ -451,64 +451,103 @@ class GRPOTrainer:
 
     def compute_ghost_inner_product_matrix_op(self):
         """
-        Compute TracIn influence scores using efficient matrix operations.
-        Returns per-sample inner products between training and validation gradients.
+        Compute TracIn influence scores for GRPO with separate validation data.
+        
+        The TracIn influence score is: IP[i] = <grad_train[i], grad_valid>
+        
+        For LoRA, grad_W = outer(g, x), so:
+        IP = sum_layers( sum_over_seq( (gA_train ⊙ gA_valid) * (x_train ⊙ x_valid) ) )
+        
+        Since training and validation have different data:
+        - Aggregate validation gradients into one direction
+        - Compute each training sample's alignment with that direction
+        
+        Returns per-training-sample inner products with aggregated validation gradient.
         """
-        sample_IP = torch.zeros((self.config.batch_size,), device=self.accelerator.device)
+        # Determine number of training samples from the buffers
+        n_train = 0
+        for name in self._train_xs:
+            if len(self._train_xs[name]) > 0:
+                n_train = torch.cat(self._train_xs[name], dim=0).shape[0]
+                break
         
-        def compute_sample_ip_vec(GAt, GBt, train_GAt, train_GBt, X, H):
-            """
-            Vectorized inner product computation:
-            IP[i] = sum_j <grad_train[i], grad_valid[j]>
-            """
-            # Block A: P_A[j] = GAt[j].T @ X[j], Q_A[i] = train_GAt[i].T @ X[i]
-            # For sequence data, we need to handle the sequence dimension
-            N = GAt.shape[0]
-            
-            # Reshape for matrix operations: [N, S*r], [N, S*d_in]
-            GAt_flat = GAt.view(N, -1)
-            train_GAt_flat = train_GAt.view(N, -1)
-            X_flat = X.view(N, -1)
-            
-            GBt_flat = GBt.view(N, -1)
-            train_GBt_flat = train_GBt.view(N, -1)
-            H_flat = H.view(N, -1)
-            
-            # Compute outer products and sum
-            # For block A: sum over all validation samples, then compute IP with each training sample
-            # This is an approximation that works for batch-level TracIn
-            S_gA = GAt_flat.sum(dim=0)  # [S*r]
-            S_x = X_flat.sum(dim=0)     # [S*d_in]
-            
-            # Per-sample IP for block A
-            sample_IP_A = (train_GAt_flat * S_gA.unsqueeze(0)).sum(dim=1) * (X_flat * S_x.unsqueeze(0)).sum(dim=1)
-            
-            # Block B: same approach
-            S_gB = GBt_flat.sum(dim=0)
-            S_h = H_flat.sum(dim=0)
-            
-            sample_IP_B = (train_GBt_flat * S_gB.unsqueeze(0)).sum(dim=1) * (H_flat * S_h.unsqueeze(0)).sum(dim=1)
-            
-            return sample_IP_A + sample_IP_B
+        if n_train == 0:
+            print("WARNING: No training samples in ghost buffers!")
+            return [0.0] * self.config.batch_size
         
-        for name in self._xs:
-            if len(self._xs[name]) == 0 or len(self._train_xs.get(name, [])) == 0:
+        sample_IP = torch.zeros((n_train,), device=self.accelerator.device)
+        
+        for name in self._train_xs:
+            if len(self._train_xs.get(name, [])) == 0 or len(self._gAs.get(name, [])) == 0:
                 continue
             
-            # Concatenate all micro-batches
-            X = torch.cat(self._train_xs[name], dim=0)
-            H = torch.cat(self._train_hs[name], dim=0)
-            train_GAt = torch.cat(self._train_gAs[name], dim=0)
-            train_GBt = torch.cat(self._train_gBs[name], dim=0)
+            # Training data: [N_train, S, dim]
+            train_X = torch.cat(self._train_xs[name], dim=0)    # [N_train, S, d_in]
+            train_H = torch.cat(self._train_hs[name], dim=0)    # [N_train, S, r]
+            train_GAt = torch.cat(self._train_gAs[name], dim=0) # [N_train, S, r]
+            train_GBt = torch.cat(self._train_gBs[name], dim=0) # [N_train, S, d_out]
             
-            GAt = torch.cat(self._gAs[name], dim=0)
-            GBt = torch.cat(self._gBs[name], dim=0)
+            # Validation gradients: [N_val, S, dim]
+            val_GAt = torch.cat(self._gAs[name], dim=0)  # [N_val, S, r]
+            val_GBt = torch.cat(self._gBs[name], dim=0)  # [N_val, S, d_out]
             
-            N = min(X.shape[0], len(sample_IP))
-            ip = compute_sample_ip_vec(GAt[:N], GBt[:N], train_GAt[:N], train_GBt[:N], X[:N], H[:N])
-            sample_IP[:N] += ip[:N]
+            # Also need validation activations (captured in _xs, _hs during validation forward)
+            val_X = torch.cat(self._xs[name], dim=0) if len(self._xs[name]) > 0 else None
+            val_H = torch.cat(self._hs[name], dim=0) if len(self._hs[name]) > 0 else None
+            
+            N_train = train_X.shape[0]
+            
+            # For LoRA gradient: grad_W_A = gA ⊗ x, grad_W_B = gB ⊗ h
+            # The full gradient is: [gA[0]*x[0], gA[1]*x[1], ..., gA[S]*x[S]] flattened
+            # Inner product: sum over all positions of (gA_train * gA_valid) * (x_train * x_valid)
+            
+            # Flatten: [N, S*r] and [N, S*d_in]
+            train_GAt_flat = train_GAt.view(N_train, -1)  # [N_train, S*r]
+            train_GBt_flat = train_GBt.view(N_train, -1)  # [N_train, S*d_out]
+            train_X_flat = train_X.view(N_train, -1)      # [N_train, S*d_in]
+            train_H_flat = train_H.view(N_train, -1)      # [N_train, S*r]
+            
+            # Aggregate validation gradients: sum over validation samples, then flatten
+            val_gA_agg = val_GAt.sum(dim=0).flatten()  # [S*r]
+            val_gB_agg = val_GBt.sum(dim=0).flatten()  # [S*d_out]
+            
+            # Aggregate validation activations if available
+            if val_X is not None:
+                val_X_agg = val_X.mean(dim=0).flatten()  # [S*d_in] - use mean for activation
+                val_H_agg = val_H.mean(dim=0).flatten()  # [S*r]
+            else:
+                # Fallback: use training activation mean as proxy
+                val_X_agg = train_X_flat.mean(dim=0)
+                val_H_agg = train_H_flat.mean(dim=0)
+            
+            # For each training sample, compute gradient inner product
+            # IP[i] = sum_pos( (gA_train[i] * gA_valid) * (x_train[i] * x_valid) )
+            #       + sum_pos( (gB_train[i] * gB_valid) * (h_train[i] * h_valid) )
+            
+            # Block A: element-wise product, then sum
+            # (train_GAt_flat * val_gA_agg): [N_train, S*r]
+            # (train_X_flat * val_X_agg): [N_train, S*d_in]
+            # We need to sum corresponding elements (same sequence position)
+            
+            # Simpler approximation: 
+            # IP_A[i] = <train_gA[i], val_gA> * <train_x[i], val_x>
+            gA_dot = (train_GAt_flat * val_gA_agg.unsqueeze(0)).sum(dim=1)  # [N_train]
+            x_dot = (train_X_flat * val_X_agg.unsqueeze(0)).sum(dim=1)       # [N_train]
+            block_A = gA_dot * x_dot.sign() * (x_dot.abs() + 1e-8).sqrt()    # Scale by activation alignment
+            
+            # Block B
+            gB_dot = (train_GBt_flat * val_gB_agg.unsqueeze(0)).sum(dim=1)  # [N_train]
+            h_dot = (train_H_flat * val_H_agg.unsqueeze(0)).sum(dim=1)       # [N_train]
+            block_B = gB_dot * h_dot.sign() * (h_dot.abs() + 1e-8).sqrt()
+            
+            sample_IP[:N_train] += block_A + block_B
         
-        return sample_IP.cpu().numpy().tolist()
+        # Pad to batch_size if needed
+        result = sample_IP.cpu().numpy().tolist()
+        while len(result) < self.config.batch_size:
+            result.append(0.0)
+        
+        return result[:self.config.batch_size]
 
     @property
     def device(self):
@@ -1282,10 +1321,9 @@ class GRPOTrainer:
         # =====================
         t = time.time()
         
-        # Clear gradient buffers for validation (keep _train_* buffers)
-        for buf in (self._gAs, self._gBs):
-            for name in buf:
-                buf[name] = []
+        # Clear ALL ghost buffers for validation (training data is saved in _train_* buffers)
+        # This ensures _xs, _hs capture ONLY validation activations
+        self._clear_ghost_buffers()
         
         # Prepare validation model inputs
         val_model_inputs = self.prepare_model_inputs(val_queries, val_responses)
