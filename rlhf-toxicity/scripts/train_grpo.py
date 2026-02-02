@@ -239,6 +239,105 @@ def get_reward_scores(reward_model, reward_tokenizer, texts, device):
     return scores_list
 
 
+def select_high_quality_validation_set(
+    val_question_tensors,
+    val_questions,
+    grpo_trainer,
+    reward_model,
+    reward_tokenizer,
+    tokenizer,
+    device,
+    pool_size=500,
+    top_k=16,
+    generation_kwargs=None,
+):
+    """
+    Pre-select high-quality validation samples for TracIn.
+    
+    Strategy:
+    1. Sample a large pool (pool_size) from validation dataset
+    2. Generate responses for all prompts in pool
+    3. Compute rewards (HIGHER = less toxic = better)
+    4. Select top-K samples with HIGHEST scores (best quality)
+    
+    Args:
+        val_question_tensors: All validation prompt tensors
+        val_questions: All validation question texts
+        grpo_trainer: GRPO trainer for generation
+        reward_model: Reward model for scoring
+        reward_tokenizer: Tokenizer for reward model
+        tokenizer: Tokenizer for decoding
+        device: Device to run on
+        pool_size: Number of prompts to evaluate (default: 500)
+        top_k: Number of best samples to select (default: 16)
+        generation_kwargs: Generation parameters
+        
+    Returns:
+        Dictionary with:
+        - queries: Selected query tensors
+        - responses: Selected response tensors
+        - scores: Selected scores (tensor)
+        - indices: Original indices in validation dataset
+        - question_texts: Selected question texts
+    """
+    print(f"\n=== Selecting High-Quality Validation Set ===")
+    print(f"Pool size: {pool_size}, Top-K: {top_k}")
+    
+    # Step 1: Sample a large pool from validation dataset
+    pool_indices = torch.randperm(len(val_question_tensors))[:pool_size]
+    pool_queries = [val_question_tensors[idx].to(device) for idx in pool_indices]
+    pool_question_texts = [val_questions[idx] for idx in pool_indices]
+    
+    print(f"Generating responses for {pool_size} prompts...")
+    
+    # Step 2: Generate responses for all prompts in pool
+    with torch.no_grad():
+        pool_responses = grpo_trainer.generate(
+            pool_queries,
+            batch_size=64,  # Process in batches for efficiency
+            return_prompt=False,
+            **generation_kwargs
+        )
+    
+    # Step 3: Compute rewards for all prompt-response pairs
+    print(f"Computing rewards for {pool_size} samples...")
+    pool_response_texts = tokenizer.batch_decode(pool_responses, skip_special_tokens=True)
+    pool_full_texts = [q + r for q, r in zip(pool_question_texts, pool_response_texts)]
+    pool_scores = get_reward_scores(reward_model, reward_tokenizer, pool_full_texts, device)
+    pool_scores_tensor = torch.tensor(pool_scores, device=device, dtype=torch.float32)
+    
+    # Step 4: Select top-K samples with HIGHEST scores (least toxic = best quality)
+    # Higher score = less toxic = better quality
+    print(f"Selecting top-{top_k} samples (highest scores = least toxic)...")
+    _, top_k_indices = torch.topk(pool_scores_tensor, k=top_k, largest=True)  # largest=True = highest scores
+    
+    # Extract selected samples
+    selected_indices = pool_indices[top_k_indices.cpu()]
+    selected_queries = [pool_queries[i] for i in top_k_indices.cpu().tolist()]
+    selected_responses = [pool_responses[i] for i in top_k_indices.cpu().tolist()]
+    selected_scores = pool_scores_tensor[top_k_indices]
+    
+    print(f"Selected validation set:")
+    print(f"  Mean score: {selected_scores.mean():.4f} (higher is better)")
+    print(f"  Score range: [{selected_scores.min():.4f}, {selected_scores.max():.4f}]")
+    print(f"  Pool mean: {pool_scores_tensor.mean():.4f}")
+    print(f"  Improvement: {selected_scores.mean() - pool_scores_tensor.mean():.4f} points higher")
+    print(f"  Quality improvement: {((selected_scores.mean() - pool_scores_tensor.mean()) / pool_scores_tensor.mean() * 100):.1f}%")
+    
+    # Clean up intermediate tensors
+    del pool_responses, pool_response_texts, pool_full_texts, pool_scores, pool_scores_tensor
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    return {
+        'queries': selected_queries,
+        'responses': selected_responses,
+        'scores': selected_scores,
+        'indices': selected_indices,
+        'question_texts': [pool_question_texts[i] for i in top_k_indices.cpu().tolist()]
+    }
+
+
 def grpo_train_loop(
     script_args,
     grpo_trainer,
@@ -421,39 +520,39 @@ def grpo_train_loop_with_validation(
     dataloader = grpo_trainer.dataloader
     device = grpo_trainer.current_device
     
-    # Pre-generate validation responses once (or regenerate periodically)
+    # Pre-select high-quality validation set
     val_sample_size = min(script_args.tracin_val_batch_size, len(val_question_tensors))
+    val_pool_size = max(500, val_sample_size * 10)  # Evaluate 10x more samples than we need
     val_regenerate_freq = 10  # Regenerate validation responses every N steps
     
-    # Initial validation generation
-    print(f"\nGenerating validation responses for {val_sample_size} samples...")
-    val_sample_indices = torch.randperm(len(val_question_tensors))[:val_sample_size]
-    val_queries_batch = [val_question_tensors[idx].to(device) for idx in val_sample_indices]
+    # Initial validation selection: use quality-based selection
+    print(f"\n=== Initial Validation Set Selection ===")
+    val_selected = select_high_quality_validation_set(
+        val_question_tensors=val_question_tensors,
+        val_questions=val_questions,
+        grpo_trainer=grpo_trainer,
+        reward_model=reward_model,
+        reward_tokenizer=reward_tokenizer,
+        tokenizer=tokenizer,
+        device=device,
+        pool_size=val_pool_size,
+        top_k=val_sample_size,
+        generation_kwargs=generation_kwargs,
+    )
     
-    with torch.no_grad():
-        val_responses_batch = grpo_trainer.generate(
-            val_queries_batch,
-            batch_size=val_sample_size,
-            return_prompt=False,
-            **generation_kwargs
-        )
-    
-    # Compute validation rewards and advantages
-    val_response_texts = tokenizer.batch_decode(val_responses_batch, skip_special_tokens=True)
-    val_query_texts = [val_questions[idx] for idx in val_sample_indices]
-    val_full_texts = [q + r for q, r in zip(val_query_texts, val_response_texts)]
-    val_scores = get_reward_scores(reward_model, reward_tokenizer, val_full_texts, device)
+    val_queries_batch = val_selected['queries']
+    val_responses_batch = val_selected['responses']
+    val_scores_tensor = val_selected['scores']
+    val_selected_indices = val_selected['indices']
     
     # Compute validation model inputs for gradient computation
     val_model_inputs = grpo_trainer.prepare_model_inputs(val_queries_batch, val_responses_batch)
     val_logprobs, val_masks = grpo_trainer.compute_logprobs(
         grpo_trainer.model, val_queries_batch, val_responses_batch, val_model_inputs
     )
-    val_scores_tensor = torch.tensor(val_scores, device=device, dtype=torch.float32)
     
-    # FREE temporary tensors used during initial validation setup
-    del val_response_texts, val_query_texts, val_full_texts, val_scores
-    del val_model_inputs, val_sample_indices
+    # FREE temporary tensors
+    del val_model_inputs
     gc.collect()
     torch.cuda.empty_cache()
     
@@ -490,37 +589,39 @@ def grpo_train_loop_with_validation(
             # FREE old validation tensors BEFORE creating new ones
             try:
                 del val_responses_batch, val_logprobs, val_masks, val_advantages
-                del val_queries_batch, val_scores_tensor
+                del val_queries_batch, val_scores_tensor, val_selected_indices
             except NameError:
                 pass  # First iteration or already deleted
             gc.collect()
             torch.cuda.empty_cache()
             
-            val_sample_indices = torch.randperm(len(val_question_tensors))[:val_sample_size]
-            val_queries_batch = [val_question_tensors[idx].to(device) for idx in val_sample_indices]
+            # Re-select high-quality validation set (model may have improved, so regenerate)
+            val_selected = select_high_quality_validation_set(
+                val_question_tensors=val_question_tensors,
+                val_questions=val_questions,
+                grpo_trainer=grpo_trainer,
+                reward_model=reward_model,
+                reward_tokenizer=reward_tokenizer,
+                tokenizer=tokenizer,
+                device=device,
+                pool_size=val_pool_size,
+                top_k=val_sample_size,
+                generation_kwargs=generation_kwargs,
+            )
             
-            with torch.no_grad():
-                val_responses_batch = grpo_trainer.generate(
-                    val_queries_batch,
-                    batch_size=val_sample_size,
-                    return_prompt=False,
-                    **generation_kwargs
-                )
+            val_queries_batch = val_selected['queries']
+            val_responses_batch = val_selected['responses']
+            val_scores_tensor = val_selected['scores']
+            val_selected_indices = val_selected['indices']
             
-            val_response_texts = tokenizer.batch_decode(val_responses_batch, skip_special_tokens=True)
-            val_query_texts = [val_questions[idx] for idx in val_sample_indices]
-            val_full_texts = [q + r for q, r in zip(val_query_texts, val_response_texts)]
-            val_scores = get_reward_scores(reward_model, reward_tokenizer, val_full_texts, device)
-            
+            # Compute validation model inputs for gradient computation
             val_model_inputs = grpo_trainer.prepare_model_inputs(val_queries_batch, val_responses_batch)
             val_logprobs, val_masks = grpo_trainer.compute_logprobs(
                 grpo_trainer.model, val_queries_batch, val_responses_batch, val_model_inputs
             )
-            val_scores_tensor = torch.tensor(val_scores, device=device, dtype=torch.float32)
             
-            # FREE temporary tensors used during regeneration
-            del val_response_texts, val_query_texts, val_full_texts, val_scores
-            del val_model_inputs, val_sample_indices
+            # FREE temporary tensors
+            del val_model_inputs
             gc.collect()
             torch.cuda.empty_cache()
             
