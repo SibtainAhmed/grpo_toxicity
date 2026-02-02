@@ -252,13 +252,13 @@ def select_high_quality_validation_set(
     generation_kwargs=None,
 ):
     """
-    Pre-select high-quality validation samples for TracIn.
+    Pre-select validation samples for TracIn based on toxicity.
     
     Strategy:
     1. Sample a large pool (pool_size) from validation dataset
     2. Generate responses for all prompts in pool
-    3. Compute rewards (HIGHER = less toxic = better)
-    4. Select top-K samples with HIGHEST scores (best quality)
+    3. Compute rewards (HIGHER = less toxic, LOWER = more toxic)
+    4. Select top-K samples with LOWEST scores (most toxic = worst quality)
     
     Args:
         val_question_tensors: All validation prompt tensors
@@ -269,7 +269,7 @@ def select_high_quality_validation_set(
         tokenizer: Tokenizer for decoding
         device: Device to run on
         pool_size: Number of prompts to evaluate (default: 500)
-        top_k: Number of best samples to select (default: 16)
+        top_k: Number of samples to select (default: 16)
         generation_kwargs: Generation parameters
         
     Returns:
@@ -280,7 +280,7 @@ def select_high_quality_validation_set(
         - indices: Original indices in validation dataset
         - question_texts: Selected question texts
     """
-    print(f"\n=== Selecting High-Quality Validation Set ===")
+    print(f"\n=== Selecting Validation Set (Most Toxic Samples) ===")
     print(f"Pool size: {pool_size}, Top-K: {top_k}")
     
     # Step 1: Sample a large pool from validation dataset
@@ -306,10 +306,10 @@ def select_high_quality_validation_set(
     pool_scores = get_reward_scores(reward_model, reward_tokenizer, pool_full_texts, device)
     pool_scores_tensor = torch.tensor(pool_scores, device=device, dtype=torch.float32)
     
-    # Step 4: Select top-K samples with HIGHEST scores (least toxic = best quality)
-    # Higher score = less toxic = better quality
-    print(f"Selecting top-{top_k} samples (highest scores = least toxic)...")
-    _, top_k_indices = torch.topk(pool_scores_tensor, k=top_k, largest=True)  # largest=True = highest scores
+    # Step 4: Select top-K samples with LOWEST scores (most toxic = worst quality)
+    # Lower score = more toxic = worse quality
+    print(f"Selecting top-{top_k} samples (lowest scores = most toxic)...")
+    _, top_k_indices = torch.topk(pool_scores_tensor, k=top_k, largest=False)  # largest=False = lowest scores
     
     # Extract selected samples
     selected_indices = pool_indices[top_k_indices.cpu()]
@@ -318,11 +318,10 @@ def select_high_quality_validation_set(
     selected_scores = pool_scores_tensor[top_k_indices]
     
     print(f"Selected validation set:")
-    print(f"  Mean score: {selected_scores.mean():.4f} (higher is better)")
+    print(f"  Mean score: {selected_scores.mean():.4f} (lower = more toxic)")
     print(f"  Score range: [{selected_scores.min():.4f}, {selected_scores.max():.4f}]")
     print(f"  Pool mean: {pool_scores_tensor.mean():.4f}")
-    print(f"  Improvement: {selected_scores.mean() - pool_scores_tensor.mean():.4f} points higher")
-    print(f"  Quality improvement: {((selected_scores.mean() - pool_scores_tensor.mean()) / pool_scores_tensor.mean() * 100):.1f}%")
+    print(f"  Difference: {selected_scores.mean() - pool_scores_tensor.mean():.4f} points lower (more toxic)")
     
     # Clean up intermediate tensors
     del pool_responses, pool_response_texts, pool_full_texts, pool_scores, pool_scores_tensor
@@ -525,7 +524,7 @@ def grpo_train_loop_with_validation(
     val_pool_size = max(500, val_sample_size * 10)  # Evaluate 10x more samples than we need
     val_regenerate_freq = 10  # Regenerate validation responses every N steps
     
-    # Initial validation selection: use quality-based selection
+    # Initial validation selection: use toxicity-based selection (most toxic samples)
     print(f"\n=== Initial Validation Set Selection ===")
     val_selected = select_high_quality_validation_set(
         val_question_tensors=val_question_tensors,
@@ -595,7 +594,7 @@ def grpo_train_loop_with_validation(
             gc.collect()
             torch.cuda.empty_cache()
             
-            # Re-select high-quality validation set (model may have improved, so regenerate)
+            # Re-select validation set (most toxic samples, model may have improved, so regenerate)
             val_selected = select_high_quality_validation_set(
                 val_question_tensors=val_question_tensors,
                 val_questions=val_questions,

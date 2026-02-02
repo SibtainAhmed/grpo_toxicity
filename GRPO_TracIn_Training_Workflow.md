@@ -112,30 +112,53 @@ For each training step:
 **Same as Standard GRPO** (see Standard GRPO document)
 
 **Additional step for TracIn:**
-- Generate validation responses once (or regenerate periodically)
+- **Pre-select high-quality validation set** (NEW! Quality-based selection)
+- Generate validation responses for selected prompts
 - Compute validation rewards and advantages
 
-**Code location:** `train_grpo.py:424-552`
+**Code location:** `train_grpo.py:523-572`
+
+#### Quality-Based Validation Selection
+
+Instead of randomly selecting validation samples, we now use a **quality-based selection strategy**:
+
 ```python
-# Pre-generate validation responses
-val_sample_size = min(script_args.tracin_val_batch_size, len(val_question_tensors))
-val_sample_indices = torch.randperm(len(val_question_tensors))[:val_sample_size]
-val_queries_batch = [val_question_tensors[idx].to(device) for idx in val_sample_indices]
+# Step 1: Sample a large pool from validation dataset (e.g., 500 prompts)
+val_pool_size = max(500, val_sample_size * 10)  # Evaluate 10x more than needed
 
-# Generate validation responses
-with torch.no_grad():
-    val_responses_batch = grpo_trainer.generate(
-        val_queries_batch,
-        batch_size=gen_batch_size,
-        **generation_kwargs
-    )
+# Step 2: Generate responses for all prompts in pool
+pool_responses = grpo_trainer.generate(pool_queries, ...)
 
-# Compute validation rewards and advantages
-val_scores = get_reward_scores(reward_model, reward_tokenizer, val_full_texts, device)
-val_advantages = grpo_trainer.compute_group_advantages(
-    torch.tensor(val_scores), num_generations=1
+# Step 3: Compute rewards (higher = less toxic = better)
+pool_scores = get_reward_scores(reward_model, reward_tokenizer, pool_full_texts, device)
+
+# Step 4: Select top-K samples with HIGHEST scores (best quality)
+_, top_k_indices = torch.topk(pool_scores_tensor, k=val_sample_size, largest=True)
+# largest=True because higher score = less toxic = better quality
+
+# Step 5: Use selected samples for TracIn
+val_selected = select_high_quality_validation_set(
+    val_question_tensors=val_question_tensors,
+    val_questions=val_questions,
+    grpo_trainer=grpo_trainer,
+    reward_model=reward_model,
+    reward_tokenizer=reward_tokenizer,
+    tokenizer=tokenizer,
+    device=device,
+    pool_size=val_pool_size,
+    top_k=val_sample_size,
+    generation_kwargs=generation_kwargs,
 )
 ```
+
+**Why Quality-Based Selection?**
+- **Random selection** (old approach): May include low-quality samples → TracIn focuses on improving random performance
+- **Quality-based selection** (new approach): Selects high-quality samples → TracIn focuses on improving good performance
+- **Result**: Better generalization and faster convergence
+
+**Regeneration Strategy:**
+- Every 10 steps, re-select validation set (model may have improved)
+- Allows validation set to adapt to model improvements
 
 ---
 
@@ -571,6 +594,98 @@ Only samples with positive influence are used for training.
 | **Training time** | Faster per step | Slower per step (gradient computation overhead) |
 | **Convergence** | Standard | Potentially faster (focus on helpful samples) |
 | **Generalization** | Standard | Potentially better (validation-guided selection) |
+| **Validation selection** | Not applicable | Quality-based (selects high-quality samples) |
+
+## Comparison with PPO TracIn
+
+### PPO TracIn Validation Strategy
+
+**PPO TracIn** uses a **fixed validation set** approach:
+
+1. **Dataset Separation** (at initialization):
+   - Splits dataset into train/test (80/20) using `build_toxicity_promptdata()`
+   - Uses `val_strategy` parameter to determine which prompts go into validation dataset:
+     - `val_strategy='random'`: Randomly selects `num_samples` prompts from test split
+     - `val_strategy='top'`: Selects **most toxic prompts** (sorts by prompt toxicity, reverse=True)
+   - **Important**: `val_strategy` only affects which prompts are in the validation dataset initially
+
+2. **Fixed Validation Set**:
+   - Uses **ENTIRE validation set** (all `val_question_tensors`, size = `val_size`, e.g., 1024)
+   - Generates responses for ALL validation prompts every step
+   - No subset selection, no quality filtering, no regeneration
+
+3. **TracIn Computation**:
+   - Processes entire validation set in batches (`tracin_val_batch_size`)
+   - Uses all validation samples for gradient computation
+   - Fixed throughout training (same validation prompts every step)
+
+**Code locations:**
+- Dataset initialization: `rlhfutils/rlhfutils/data.py:679-719`
+- Training loop: `rlhfutils/rlhfutils/rl_utils.py:1520` (generates for all `val_question_tensors`)
+- TracIn step: `ppo_trainer.py:1789` (iterates through entire `val_size`)
+
+```python
+# rlhfutils/rlhfutils/data.py:679-719 - Dataset initialization
+def build_toxicity_promptdata(..., val_strategy='random'):
+    ds = ds.train_test_split(test_size=0.2, shuffle=False, seed=seed)
+    
+    if val_strategy == 'random':
+        ds_valid = ds['test'].select(range(num_samples))  # Random prompts
+    elif val_strategy == 'top':        
+        # Selects MOST TOXIC prompts (counterproductive!)
+        test_split = ds["test"].map(lambda x: {"toxicity": x["prompt"]["toxicity"]})
+        ds_valid = test_split.sort("toxicity", reverse=True).select(range(num_samples))
+    
+    return ds_train, ds_valid  # Returns entire validation dataset
+
+# rlhfutils/rlhfutils/rl_utils.py:1520 - Training loop
+val_response_tensors, val_kl_mask = get_rollouts(
+    ppo_trainer, val_question_tensors, ...  # Uses ALL val_question_tensors
+)
+
+# ppo_trainer.py:1789 - TracIn computation
+for tracin_batch_start in range(0, self.config.val_size, self.config.tracin_val_batch_size):
+    # Processes ENTIRE validation set in batches
+    # val_size = 1024, tracin_val_batch_size = 8 → 128 batches
+```
+
+### GRPO TracIn Validation Strategy (Our Approach)
+
+**GRPO TracIn** uses a **response-quality-based selection**:
+
+1. **Dataset Separation**: Same as PPO (separates at initialization)
+2. **Response-Based Selection**: Selects validation **samples** (prompt + response) based on response quality:
+   - Samples a large pool (e.g., 500 prompts)
+   - Generates responses for all prompts
+   - Computes rewards (higher = less toxic = better)
+   - Selects top-K with **highest scores** (best quality)
+3. **Subset Selection**: Uses only selected subset (e.g., 16 samples) for TracIn computation
+4. **Quality Filtering**: Filters based on response quality after generation
+
+### Key Differences
+
+| Aspect | PPO TracIn | GRPO TracIn |
+|--------|------------|-------------|
+| **Selection timing** | At initialization (prompt-based) | After generation (response-based) |
+| **Selection criterion** | Prompt toxicity (`val_strategy`) | Response quality (reward scores) |
+| **Validation set size** | Full set (e.g., 1024) - uses ALL | Selected subset (e.g., 16) - uses top-K |
+| **Quality focus** | Prompt toxicity (may select toxic prompts) | Response quality (selects best responses) |
+| **Adaptation** | Fixed throughout training | Regenerates every 10 steps |
+| **Subset selection** | No - uses entire validation set | Yes - selects top-K from pool |
+
+### Why GRPO's Approach is Better
+
+1. **Response Quality Matters**: TracIn measures influence on validation **performance**, which depends on response quality, not prompt toxicity
+2. **Quality-Based Selection**: Selects samples with highest reward scores (least toxic responses) → TracIn focuses on improving good performance
+3. **Adaptive**: Regenerates validation set periodically to adapt to model improvements
+4. **Efficient**: Uses smaller subset (16 vs 1024) while maintaining quality
+
+### PPO's `val_strategy='top'` Issue
+
+PPO's `val_strategy='top'` selects **most toxic prompts**, which is counterproductive:
+- Most toxic prompts → Model generates toxic responses → Low reward scores
+- TracIn focuses on improving performance on low-quality samples
+- **Better approach**: Select prompts that lead to high-quality responses (what GRPO does)
 
 ### When to Use Each
 
@@ -612,3 +727,74 @@ Only samples with positive influence are used for training.
 - Hook-based gradient capture (memory-efficient)
 - Sequence-length independent gradient reconstruction (efficient matrix operations)
 - Validation-guided sample selection (better generalization)
+- **Quality-based validation selection** (selects high-quality responses, not random/prompt-based)
+
+---
+
+## Appendix: PPO TracIn Validation Strategy (For Comparison)
+
+### How PPO TracIn Selects Validation Samples
+
+**PPO TracIn** uses a **fixed validation set** strategy:
+
+1. **Dataset Separation** (at initialization, `build_toxicity_promptdata`):
+   - Splits dataset into train/test (80/20)
+   - Uses `val_strategy` to determine which prompts go into validation dataset:
+     - `val_strategy='random'`: Randomly selects `num_samples` prompts from test split
+     - `val_strategy='top'`: Selects **most toxic prompts** (sorts by prompt toxicity, reverse=True)
+   - **Important**: `val_strategy` only affects initial dataset construction
+
+2. **Fixed Validation Set** (during training):
+   - Uses **ENTIRE validation set** (all prompts selected at initialization, e.g., 1024 samples)
+   - Generates responses for ALL validation prompts every step
+   - **No subset selection** - processes entire validation set in batches
+   - **No quality filtering** - uses all validation samples regardless of response quality
+   - **Fixed throughout training** - same validation prompts every step
+
+3. **TracIn Computation**:
+   - Iterates through entire validation set: `for tracin_batch_start in range(0, val_size, tracin_val_batch_size)`
+   - Processes in batches (e.g., 1024 samples in batches of 8 = 128 batches)
+   - Uses all validation samples for gradient computation
+
+**Code Reference:**
+```python
+# rlhfutils/rlhfutils/data.py:679-719
+def build_toxicity_promptdata(..., val_strategy='random'):
+    ds = ds.train_test_split(test_size=0.2, shuffle=False, seed=seed)
+    
+    if val_strategy == 'random':
+        ds_valid = ds['test'].select(range(num_samples))  # Random prompts
+    elif val_strategy == 'top':        
+        # Selects MOST TOXIC prompts (counterproductive!)
+        test_split = ds["test"].map(lambda x: {"toxicity": x["prompt"]["toxicity"]})
+        ds_valid = test_split.sort("toxicity", reverse=True).select(range(num_samples))
+    
+    return ds_train, ds_valid
+```
+
+### Why GRPO's Approach is Superior
+
+| Issue with PPO | GRPO Solution |
+|----------------|---------------|
+| **Prompt-based selection**: Selects based on prompt toxicity, not response quality | **Response-based selection**: Selects based on actual response quality (reward scores) |
+| **`val_strategy='top'` problem**: Selects most toxic prompts → low-quality responses | **Quality-based**: Selects highest reward scores → high-quality responses |
+| **Fixed validation set**: Same prompts throughout training | **Adaptive**: Regenerates every 10 steps to adapt to model improvements |
+| **Large validation set**: Uses all 1024 samples (computationally expensive) | **Efficient subset**: Uses top-16 samples (computationally efficient) |
+
+### Summary
+
+- **PPO TracIn**: 
+  - At initialization: Uses `val_strategy` to select prompts for validation dataset (`'random'` or `'top'` toxic)
+  - During training: Uses **ENTIRE validation set** (all prompts, e.g., 1024 samples)
+  - No subset selection, no quality filtering, fixed throughout training
+  
+- **GRPO TracIn**: 
+  - At initialization: Separates validation dataset (same as PPO)
+  - During training: Generates responses for large pool (500), selects top-K by quality (16), uses subset for TracIn
+  - Quality-based subset selection, regenerates every 10 steps
+  
+- **Key differences**: 
+  1. **Selection timing**: PPO selects at initialization (prompt-based), GRPO selects during training (response-based)
+  2. **Set size**: PPO uses entire validation set (1024), GRPO uses quality-filtered subset (16)
+  3. **Adaptation**: PPO fixed set, GRPO regenerates every 10 steps
+  4. **Quality focus**: PPO based on prompt toxicity, GRPO based on response quality
