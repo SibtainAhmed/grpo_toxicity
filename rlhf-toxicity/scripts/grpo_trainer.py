@@ -1467,9 +1467,7 @@ class GRPOTrainer:
         # =====================
         t = time.time()
         
-        # Select samples with positive influence
-        # CRITICAL: If most samples have negative influence, we might be selecting wrong samples
-        # Try multiple selection strategies and log statistics
+        # Analyze influence score distribution
         ghost_ip_array = np.array(ghost_ip)
         positive_count = np.sum(ghost_ip_array > 0)
         negative_count = np.sum(ghost_ip_array < 0)
@@ -1482,18 +1480,28 @@ class GRPOTrainer:
         print(f'  Mean: {np.mean(ghost_ip_array):.6f}, Std: {np.std(ghost_ip_array):.6f}')
         print(f'  Min: {np.min(ghost_ip_array):.6f}, Max: {np.max(ghost_ip_array):.6f}')
         
-        # Selection strategy: Use positive influence (standard TracIn)
-        # If too few samples selected (< 10%), try top-K instead
-        selected_ids = np.where(ghost_ip_array > 0)[0]
+        # NEW APPROACH: Use influence-weighted training instead of sample selection
+        # This ensures we train on ALL samples (same as standard GRPO) but weight by influence
+        # Compute influence weights: normalize to [0, 1] range with positive bias
+        influence_weights = torch.tensor(ghost_ip_array, device=self.current_device, dtype=torch.float32)
         
-        # Fallback: If less than 10% selected, use top 50% by influence
-        if len(selected_ids) < max(1, int(0.1 * bs)):
-            print(f'WARNING: Only {len(selected_ids)} samples with positive influence (< 10%). Using top 50% instead.')
-            top_k = max(1, int(0.5 * bs))
-            selected_ids = np.argsort(ghost_ip_array)[-top_k:]
-            print(f'Selected top-{top_k} samples by influence (fallback strategy)')
-        else:
-            print(f'Number of selected samples (positive influence): {len(selected_ids)} / {bs}')
+        # Shift and scale: positive influence → weight > 1, negative → weight < 1
+        # Using softmax-like normalization: weights = softmax(influence * temperature)
+        # This keeps all weights positive and differentiates based on influence
+        influence_temp = 1.0  # Temperature for scaling
+        influence_weights = torch.softmax(influence_weights * influence_temp, dim=0) * bs
+        # Clamp to reasonable range
+        influence_weights = torch.clamp(influence_weights, min=0.1, max=5.0)
+        
+        print(f'Influence weights: mean={influence_weights.mean():.4f}, std={influence_weights.std():.4f}')
+        print(f'  min={influence_weights.min():.4f}, max={influence_weights.max():.4f}')
+        
+        # Store influence weights in batch_dict for weighted training
+        batch_dict["influence_weights"] = influence_weights
+        
+        # For backward compatibility, still compute selected_ids (for logging)
+        selected_ids = np.where(ghost_ip_array > 0)[0]
+        print(f'Number of samples with positive influence: {len(selected_ids)} / {bs}')
         
         # Save generated data if requested
         if gen_data_dir is not None:
@@ -1514,104 +1522,91 @@ class GRPOTrainer:
             print(f'File saved to {gen_data_dir}/grpo_tracin_samples_seed-{self.config.seed}_{self.save_cnt}.pt')
             self.save_cnt += 1
         
-        # Train on selected samples
-        if len(selected_ids) > 0:
-            sel_bs = len(selected_ids)
-            all_stats = []
-            self.model.train()
+        # NEW: Train on ALL samples with influence-weighted advantages
+        # This is the key change - instead of training on fewer samples,
+        # we train on all samples but weight their contribution by influence
+        all_stats = []
+        self.model.train()
+        
+        print(f"Training on ALL {bs} samples with influence-weighted advantages")
+        
+        for epoch in range(self.config.grpo_epochs):
+            # Shuffle ALL indices (not just selected)
+            indices = torch.randperm(bs)
             
-            # Use smaller batch size if we have fewer samples than backward_batch_size
-            effective_backward_bs = min(self.config.backward_batch_size, sel_bs)
-            effective_mini_bs = min(self.config.mini_batch_size, effective_backward_bs)
-            
-            print(f"Training on {sel_bs} selected samples (effective_backward_bs={effective_backward_bs}, effective_mini_bs={effective_mini_bs})")
-            
-            for epoch in range(self.config.grpo_epochs):
-                # Shuffle selected indices
-                b_inds = np.random.permutation(selected_ids)
+            for start_idx in range(0, bs, self.config.mini_batch_size):
+                end_idx = min(start_idx + self.config.mini_batch_size, bs)
+                batch_indices = indices[start_idx:end_idx]
                 
-                for backward_batch_start in range(0, sel_bs, effective_backward_bs):
-                    backward_batch_end = min(backward_batch_start + effective_backward_bs, sel_bs)
-                    backward_batch_inds = b_inds[backward_batch_start:backward_batch_end]
-                    
-                    # Process in mini-batches
-                    for mini_batch_start in range(0, len(backward_batch_inds), effective_mini_bs):
-                        mini_batch_end = min(mini_batch_start + effective_mini_bs, len(backward_batch_inds))
-                        mini_batch_inds = backward_batch_inds[mini_batch_start:mini_batch_end]
-                        
-                        # Skip empty batches
-                        if len(mini_batch_inds) == 0:
-                            continue
-                        
-                        # Get mini-batch data
-                        mb_logprobs_old = batch_dict["logprobs"][mini_batch_inds].detach()
-                        mb_advantages = batch_dict["advantages_expanded"][mini_batch_inds].detach()
-                        mb_masks = batch_dict["masks"][mini_batch_inds]
-                        mb_queries = [batch_dict["queries"][i] for i in mini_batch_inds]
-                        mb_responses = [batch_dict["responses"][i] for i in mini_batch_inds]
-                        
-                        mb_model_inputs = {
-                            "input_ids": batch_dict["input_ids"][mini_batch_inds],
-                            "attention_mask": batch_dict["attention_mask"][mini_batch_inds],
-                        }
-                        
-                        # Forward pass
-                        with self.accelerator.accumulate(self.model):
-                            outputs = self.model(
-                                input_ids=mb_model_inputs["input_ids"],
-                                attention_mask=mb_model_inputs["attention_mask"],
-                            )
-                            logits = outputs.logits
-                            
-                            # Compute new log probs
-                            mb_logprobs_new = self._compute_logprobs_consistent(
-                                logits, mb_queries, mb_responses, mb_model_inputs, max_response_len
-                            )
-                            
-                            # Extract response logits
-                            response_logits = self._extract_response_logits_consistent(
-                                logits, mb_queries, mb_responses, max_response_len
-                            )
-                            
-                            # Compute loss
-                            pg_loss, stats = self.loss(
-                                mb_logprobs_old,
-                                response_logits,
-                                mb_logprobs_new,
-                                mb_masks,
-                                mb_advantages,
-                            )
-                            
-                            # Backward pass
-                            self.accelerator.backward(pg_loss)
-                            
-                            if self.config.max_grad_norm is not None:
-                                torch.nn.utils.clip_grad_norm_(
-                                    self.model.parameters(),
-                                    self.config.max_grad_norm
-                                )
-                            
-                            self.optimizer.step()
-                            self.optimizer.zero_grad()
-                            
-                            # Convert stats tensors to CPU/scalars before storing
-                            stats_cpu = {k: v.detach().cpu().item() if isinstance(v, torch.Tensor) else v for k, v in stats.items()}
-                            all_stats.append(stats_cpu)
-                            
-                            # FREE mini-batch tensors immediately
-                            del outputs, logits, mb_logprobs_new, response_logits, pg_loss
-                            del mb_logprobs_old, mb_advantages, mb_masks, mb_model_inputs
-            
-            timing["time/grpo/optimization"] = time.time() - t
-            
-            # Memory cleanup after training loop
-            gc.collect()
-            torch.cuda.empty_cache()
-            log_gpu_memory("After training loop", verbose=True)
-        else:
-            print("Warning: No samples with positive influence. Skipping training step.")
-            all_stats = [{"loss/policy": 0.0, "loss/total": 0.0}]  # Use scalars directly
-            timing["time/grpo/optimization"] = time.time() - t
+                # Get mini-batch data
+                mb_logprobs_old = batch_dict["logprobs"][batch_indices].detach()
+                mb_advantages = batch_dict["advantages_expanded"][batch_indices].detach()
+                mb_masks = batch_dict["masks"][batch_indices]
+                mb_queries = [batch_dict["queries"][i] for i in batch_indices]
+                mb_responses = [batch_dict["responses"][i] for i in batch_indices]
+                mb_influence_weights = batch_dict["influence_weights"][batch_indices]
+                
+                mb_model_inputs = {
+                    "input_ids": batch_dict["input_ids"][batch_indices],
+                    "attention_mask": batch_dict["attention_mask"][batch_indices],
+                }
+                
+                # Apply influence weights to advantages
+                # Higher weight for samples with positive influence
+                mb_weighted_advantages = mb_advantages * mb_influence_weights.unsqueeze(-1)
+                
+                # Forward pass
+                outputs = self.model(
+                    input_ids=mb_model_inputs["input_ids"],
+                    attention_mask=mb_model_inputs["attention_mask"],
+                )
+                logits = outputs.logits
+                
+                # Compute new log probs
+                mb_logprobs_new = self._compute_logprobs_consistent(
+                    logits, mb_queries, mb_responses, mb_model_inputs, max_response_len
+                )
+                
+                # Extract response logits
+                response_logits = self._extract_response_logits_consistent(
+                    logits, mb_queries, mb_responses, max_response_len
+                )
+                
+                # Compute loss with weighted advantages
+                pg_loss, stats = self.loss(
+                    mb_logprobs_old,
+                    response_logits,
+                    mb_logprobs_new,
+                    mb_masks,
+                    mb_weighted_advantages,
+                )
+                
+                # Backward pass
+                self.accelerator.backward(pg_loss)
+                
+                if self.config.max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.max_grad_norm
+                    )
+                
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                
+                # Convert stats tensors to CPU/scalars before storing
+                stats_cpu = {k: v.detach().cpu().item() if isinstance(v, torch.Tensor) else v for k, v in stats.items()}
+                all_stats.append(stats_cpu)
+                
+                # FREE mini-batch tensors immediately
+                del outputs, logits, mb_logprobs_new, response_logits, pg_loss
+                del mb_logprobs_old, mb_advantages, mb_masks, mb_model_inputs
+        
+        timing["time/grpo/optimization"] = time.time() - t
+        
+        # Memory cleanup after training loop
+        gc.collect()
+        torch.cuda.empty_cache()
+        log_gpu_memory("After training loop", verbose=True)
         
         # Aggregate stats (with safety check for empty list)
         # All stats are now scalars (converted to CPU in training loop)

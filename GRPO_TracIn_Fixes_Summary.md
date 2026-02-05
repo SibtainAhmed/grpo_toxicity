@@ -1,8 +1,44 @@
-# GRPO TracIn Performance Issues - Fixes Applied
+# GRPO TracIn Performance Issues - Fixes Applied (Updated)
 
 ## Summary
 
 I've identified and fixed several critical issues in the GRPO TracIn implementation that were causing poor performance compared to vanilla GRPO.
+
+## 🚨 ROOT CAUSE FOUND!
+
+### Critical Issue #1: **Different `num_generations`** (MAJOR!)
+| Setting | Standard GRPO | TracIn GRPO (Old) | TracIn GRPO (Fixed) |
+|---------|---------------|-------------------|---------------------|
+| `num_generations` | **8** | 4 | **8** |
+| Samples per step | 512 | 256 | 512 |
+
+**TracIn was training on HALF the data per step!**
+
+### Critical Issue #2: **Sample Selection Reduced Training Data**
+- Standard: 512 samples × 4 epochs = 2048 gradient updates per step
+- TracIn (old, 50% selected): 128 samples × 4 epochs = 512 gradient updates
+- TracIn (fixed, influence-weighted): 512 samples × 4 epochs = 2048 gradient updates
+
+**TracIn was getting 4x fewer gradient updates!**
+
+### Critical Issue #3: **Validation Set Too Small**
+- Old: `tracin_val_batch_size=16` (too noisy)
+- Fixed: `tracin_val_batch_size=64` (more reliable)
+
+## Major Changes Made
+
+### 1. **Matched `num_generations=8`** (in `run_train_grpo_iif.sh`)
+Both Standard and TracIn now use the same number of generations for fair comparison.
+
+### 2. **Influence-Weighted Training** (NEW APPROACH!)
+Instead of selecting only positive-influence samples (reducing training data), we now:
+- Train on ALL samples (same as standard GRPO)
+- Weight each sample's contribution by its influence score
+- High-influence samples contribute more to the loss
+- Low/negative-influence samples contribute less
+
+### 3. **Increased Validation Set Size**
+`tracin_val_batch_size` increased from 16 to 64 for more reliable gradient estimates.
 
 ## Issues Identified
 
