@@ -39,14 +39,14 @@ accelerate launch --main_process_port=29525 \
     --val_size=512 \
     --learning_rate=1e-5 \
     --early_stopping=False \
-    --output_dir=output_tox_grpo_tracin_2.7b_fp16_kl-0.04_val-512_gen-8_tgt-seqloss-lastadv_mbs-32_seed-22 \
+    --output_dir=output_tox_grpo_tracin_2.7b_fp16_kl-0.04_val-512_gen-8_tgt-seqloss-reward_mbs-32_seed-22 \
     --init_kl_coef=0.04 \
     --steps=1000 \
     --min_length=20 \
     --temperature=1.0 \
     --wandb_project="grpo-detox" \
-    --run_name="grpo-tracin-2.7b-fp16-kl-0.04-val-512_gen-8_tgt-seqloss-lastadv_mbs-32_seed-22" \
+    --run_name="grpo-tracin-2.7b-fp16-kl-0.04-val-512_gen-8_tgt-seqloss-reward_mbs-32_seed-22" \
     --tracin \
     --with_validation \
-    --val_loss_type="seqloss-lastadv" \
-    --gen_data_dir="gen_tox_grpo_samples_tracin_2.7b_fp16_kl-0.04_val-512_gen-8_tgt-seqloss-lastadv_mbs-32_seed-22"
+    --val_loss_type="seqloss-reward" \
+    --gen_data_dir="gen_tox_grpo_samples_tracin_2.7b_fp16_kl-0.04_val-512_gen-8_tgt-seqloss-reward_mbs-32_seed-22"

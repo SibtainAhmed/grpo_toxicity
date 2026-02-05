@@ -693,6 +693,7 @@ def grpo_train_loop_with_validation(
             val_advantages=val_advantages,
             val_logprobs=val_logprobs,
             val_masks=val_masks,
+            val_scores=val_scores_tensor,  # Pass RAW SCORES for seqloss-reward
             gen_data_dir=script_args.gen_data_dir,
         )
         timing["time/grpo/step"] = time.time() - t

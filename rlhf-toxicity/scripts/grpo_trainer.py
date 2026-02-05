@@ -1116,6 +1116,7 @@ class GRPOTrainer:
         val_advantages: torch.FloatTensor,
         val_logprobs: torch.FloatTensor,
         val_masks: torch.FloatTensor,
+        val_scores: torch.FloatTensor = None,  # RAW validation scores for seqloss-reward
         gen_data_dir: str = None,
     ):
         """
@@ -1346,6 +1347,23 @@ class GRPOTrainer:
             print(f'Validation loss (seqloss-lastadv): {validation_loss.item():.4f}')
             print(f'  seq_logprob range: [{seq_logprob.min():.4f}, {seq_logprob.max():.4f}]')
             print(f'  seq_score range: [{seq_score.min():.4f}, {seq_score.max():.4f}]')
+            
+        elif self.config.val_loss_type == 'seqloss-reward':
+            # USE RAW REWARD SCORES - NOT NORMALIZED ADVANTAGES!
+            # This is critical for TracIn to work correctly with GRPO
+            # High reward = less toxic = we want to MAXIMIZE log_prob
+            # Gradient points in direction to increase log_prob for high-reward samples
+            if val_scores is None:
+                print("ERROR: val_scores is None but val_loss_type='seqloss-reward'. Falling back to advantages.")
+                val_scores = val_advantages.detach()
+            seq_logprob = (val_logprobs_new.to(torch.float32) * val_masks.detach()).sum(dim=1)
+            seq_score = val_scores.detach()
+            per_seq_loss = -seq_logprob * seq_score
+            validation_loss = per_seq_loss.mean()
+            print(f'Validation loss (seqloss-reward): {validation_loss.item():.4f}')
+            print(f'  seq_logprob range: [{seq_logprob.min():.4f}, {seq_logprob.max():.4f}]')
+            print(f'  seq_score (RAW REWARDS) range: [{seq_score.min():.4f}, {seq_score.max():.4f}]')
+            print(f'  seq_score mean: {seq_score.mean():.4f} (higher = less toxic = better)')
             
         else:
             raise NotImplementedError(f"Validation loss type {self.config.val_loss_type} not implemented.")
