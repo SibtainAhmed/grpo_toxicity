@@ -451,121 +451,76 @@ class GRPOTrainer:
 
     def compute_ghost_inner_product_matrix_op(self):
         """
-        Compute TracIn influence scores for GRPO with separate validation data.
+        Compute TracIn influence scores using PPO step_part_I's approach:
+        - Training gradients use TRAINING activations: train_gA.T @ train_X
+        - Validation gradients use VALIDATION activations: val_gA.T @ val_X
         
-        For LoRA layers, the gradient w.r.t. weight W_A [r, d_in] is:
-            grad_W_A = sum_over_seq( g_A.T @ x )  → [r, d_in]
-        
-        This properly aggregates over the sequence dimension, making it independent
-        of sequence length (training and validation can have different lengths).
-        
-        Returns per-training-sample inner products with aggregated validation gradient.
+        This matches PPO's compute_ghost_inner_product_diff_train_val_matrix_op exactly.
         """
-        # Determine number of training samples from the buffers
-        n_train = 0
-        for name in self._train_xs:
-            if len(self._train_xs[name]) > 0:
-                n_train = torch.cat(self._train_xs[name], dim=0).shape[0]
-                break
+        sample_IP = torch.zeros((self.config.batch_size,), device=self.accelerator.device)
         
-        if n_train == 0:
-            print("WARNING: No training samples in ghost buffers!")
-            return [0.0] * self.config.batch_size
+        def compute_sample_ip_train_vec(GAt, GBt, train_GAt, train_GBt, X, H, train_X, train_H):
+            """
+            PPO step_part_I style with SEPARATE activations:
+            - Validation: P_A[j] = GAt[j].T @ X[j] (validation activations)
+            - Training: Q_A[i] = train_GAt[i].T @ train_X[i] (training activations)
+            """
+            # Convert to float32 for numerical stability
+            GAt = GAt.float()
+            GBt = GBt.float()
+            train_GAt = train_GAt.float()
+            train_GBt = train_GBt.float()
+            X = X.float()
+            H = H.float()
+            train_X = train_X.float()
+            train_H = train_H.float()
+            
+            # Block A:
+            # P_A[j] = GAt[j].T @ X[j]  → shape [n_val, r, d_in]
+            P_A = torch.matmul(GAt.transpose(1,2), X)
+            S_A = P_A.sum(dim=0)       # [r, d_in]
+            # Q_A[i] = train_GAt[i].T @ train_X[i]  → [n_train, r, d_in]
+            Q_A = torch.matmul(train_GAt.transpose(1,2), train_X)
+            sample_A = (Q_A * S_A).sum(dim=(1,2))  # → [n_train]
+
+            # Block B:
+            # P_B[j] = GBt[j].T @ H[j]  → [n_val, d_out, r]
+            P_B = torch.matmul(GBt.transpose(1,2), H)
+            S_B = P_B.sum(dim=0)       # [d_out, r]
+            # Q_B[i] = train_GBt[i].T @ train_H[i]  → [n_train, d_out, r]
+            Q_B = torch.matmul(train_GBt.transpose(1,2), train_H)
+            sample_B = (Q_B * S_B).sum(dim=(1,2))  # → [n_train]
+
+            return sample_A + sample_B
         
-        sample_IP = torch.zeros((n_train,), device=self.accelerator.device)
-        
+        # Loop over every LoRA adapter
         for name in self._train_xs:
             if len(self._train_xs.get(name, [])) == 0 or len(self._gAs.get(name, [])) == 0:
                 continue
             
-            # Training data: [N_train, S_train, dim]
-            train_X = torch.cat(self._train_xs[name], dim=0)    # [N_train, S_train, d_in]
-            train_H = torch.cat(self._train_hs[name], dim=0)    # [N_train, S_train, r]
-            train_GAt = torch.cat(self._train_gAs[name], dim=0) # [N_train, S_train, r]
-            train_GBt = torch.cat(self._train_gBs[name], dim=0) # [N_train, S_train, d_out]
+            # Training data (activations AND gradients)
+            train_X = torch.cat(self._train_xs[name], dim=0)    # [N_train, S, d_in]
+            train_H = torch.cat(self._train_hs[name], dim=0)    # [N_train, S, r]
+            train_GAt = torch.cat(self._train_gAs[name], dim=0) # [N_train, S, r]
+            train_GBt = torch.cat(self._train_gBs[name], dim=0) # [N_train, S, d_out]
             
-            # Validation data: [N_val, S_val, dim] - may have different sequence length!
-            val_X = torch.cat(self._xs[name], dim=0) if len(self._xs[name]) > 0 else None
-            val_H = torch.cat(self._hs[name], dim=0) if len(self._hs[name]) > 0 else None
-            val_GAt = torch.cat(self._gAs[name], dim=0)  # [N_val, S_val, r]
-            val_GBt = torch.cat(self._gBs[name], dim=0)  # [N_val, S_val, d_out]
+            # Validation data (activations AND gradients from validation forward/backward)
+            X   = torch.cat(self._xs[name], dim=0) if len(self._xs[name]) > 0 else None
+            H   = torch.cat(self._hs[name], dim=0) if len(self._hs[name]) > 0 else None
+            GAt = torch.cat(self._gAs[name], dim=0)
+            GBt = torch.cat(self._gBs[name], dim=0)
             
             N_train = train_X.shape[0]
-            N_val = val_GAt.shape[0]
             
-            # Get dimensions
-            r = train_GAt.shape[2]      # LoRA rank
-            d_in = train_X.shape[2]     # Input dimension to lora_A
-            d_out = train_GBt.shape[2]  # Output dimension from lora_B
+            if X is None or H is None:
+                print(f"WARNING: No validation activations for layer {name}")
+                continue
             
-            # =====================
-            # Compute validation gradient (aggregated over all validation samples)
-            # grad_W_A = sum_i sum_s (g_A[i,s,:].T @ x[i,s,:]) → [r, d_in]
-            # =====================
-            
-            if val_X is not None:
-                # Reshape for batch matmul: [N_val, S_val, r, 1] @ [N_val, S_val, 1, d_in]
-                # g_A: [N_val, S_val, r] → [N_val*S_val, r, 1]
-                # x:   [N_val, S_val, d_in] → [N_val*S_val, 1, d_in]
-                # Convert to float32 for numerical stability in mixed precision
-                val_gA_reshaped = val_GAt.float().reshape(-1, r, 1)       # [N_val*S_val, r, 1]
-                val_x_reshaped = val_X.float().reshape(-1, 1, d_in)       # [N_val*S_val, 1, d_in]
-                val_grad_A = (val_gA_reshaped @ val_x_reshaped).sum(dim=0)  # [r, d_in]
-                
-                val_gB_reshaped = val_GBt.float().reshape(-1, d_out, 1)   # [N_val*S_val, d_out, 1]
-                val_h_reshaped = val_H.float().reshape(-1, 1, r)          # [N_val*S_val, 1, r]
-                val_grad_B = (val_gB_reshaped @ val_h_reshaped).sum(dim=0)  # [d_out, r]
-            else:
-                # Fallback: simple sum of gradients
-                val_grad_A = val_GAt.float().sum(dim=(0, 1)).unsqueeze(1) @ train_X.float().mean(dim=(0, 1)).unsqueeze(0)
-                val_grad_B = val_GBt.float().sum(dim=(0, 1)).unsqueeze(1) @ train_H.float().mean(dim=(0, 1)).unsqueeze(0)
-            
-            # Flatten validation gradients
-            val_grad_A_flat = val_grad_A.flatten()  # [r * d_in]
-            val_grad_B_flat = val_grad_B.flatten()  # [d_out * r]
-            
-            # =====================
-            # Compute training gradients (per sample)
-            # For each training sample i: grad_W_A[i] = sum_s (g_A[i,s,:].T @ x[i,s,:])
-            # =====================
-            
-            # Process in smaller chunks to avoid memory issues
-            chunk_size = min(16, N_train)
-            for chunk_start in range(0, N_train, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, N_train)
-                chunk_N = chunk_end - chunk_start
-                
-                # Get chunk data
-                chunk_gA = train_GAt[chunk_start:chunk_end]  # [chunk_N, S, r]
-                chunk_x = train_X[chunk_start:chunk_end]     # [chunk_N, S, d_in]
-                chunk_gB = train_GBt[chunk_start:chunk_end]  # [chunk_N, S, d_out]
-                chunk_h = train_H[chunk_start:chunk_end]     # [chunk_N, S, r]
-                
-                S_train = chunk_gA.shape[1]
-                
-                # Compute per-sample gradients using einsum
-                # grad_W_A[i] = sum_s g_A[i,s,:].T @ x[i,s,:] = einsum('sr,sd->rd', gA[i], x[i])
-                # For batch: einsum('nsr,nsd->nrd', chunk_gA, chunk_x)
-                # Convert to float32 for numerical stability in mixed precision
-                train_grad_A = torch.einsum('nsr,nsd->nrd', chunk_gA.float(), chunk_x.float())  # [chunk_N, r, d_in]
-                train_grad_B = torch.einsum('nso,nsr->nor', chunk_gB.float(), chunk_h.float())  # [chunk_N, d_out, r]
-                
-                # Flatten per sample: [chunk_N, r*d_in] and [chunk_N, d_out*r]
-                train_grad_A_flat = train_grad_A.view(chunk_N, -1)
-                train_grad_B_flat = train_grad_B.view(chunk_N, -1)
-                
-                # Compute inner products with validation gradient
-                ip_A = (train_grad_A_flat * val_grad_A_flat.unsqueeze(0)).sum(dim=1)  # [chunk_N]
-                ip_B = (train_grad_B_flat * val_grad_B_flat.unsqueeze(0)).sum(dim=1)  # [chunk_N]
-                
-                sample_IP[chunk_start:chunk_end] += ip_A + ip_B
+            sample_IP[:N_train] += compute_sample_ip_train_vec(
+                GAt, GBt, train_GAt, train_GBt, X, H, train_X, train_H
+            )
         
-        # Pad to batch_size if needed
-        result = sample_IP.cpu().numpy().tolist()
-        while len(result) < self.config.batch_size:
-            result.append(0.0)
-        
-        return result[:self.config.batch_size]
+        return [x.item() for x in sample_IP]
 
     @property
     def device(self):
@@ -1335,26 +1290,28 @@ class GRPOTrainer:
         log_gpu_memory("After training gradient capture", verbose=True)
         
         # =====================
-        # Part III: Capture VALIDATION gradients via hooks (PPO-style)
+        # Part III: Capture VALIDATION gradients via hooks (PPO step_part_I style)
         # =====================
         t = time.time()
         
-        # Clear ALL ghost buffers for validation (training data is saved in _train_* buffers)
-        # This ensures _xs, _hs capture ONLY validation activations
-        self._clear_ghost_buffers()
+        # PPO step_part_I style: Clear ALL buffers before validation forward pass
+        # This ensures separate activations for training and validation
+        for buf in (self._xs, self._hs, self._gAs, self._gBs):
+            for name in buf:
+                buf[name] = []
         
-        # Prepare validation model inputs
+        # Forward pass on validation set to capture validation activations and prepare for backward
         val_model_inputs = self.prepare_model_inputs(val_queries, val_responses)
         
-        # Forward pass on validation set with ghost recording
         self._record_ghost = True
         val_outputs = self.model(
             input_ids=val_model_inputs["input_ids"],
             attention_mask=val_model_inputs["attention_mask"],
         )
         val_logits = val_outputs.logits
+        self._record_ghost = False  # Stop recording activations, we'll record gradients on backward
         
-        # Recompute validation logprobs
+        # Recompute validation logprobs from this forward pass (needed for gradient flow)
         val_logprobs_new = self._compute_logprobs_consistent(
             val_logits, val_queries, val_responses, val_model_inputs, val_logprobs.shape[1]
         )
@@ -1363,9 +1320,12 @@ class GRPOTrainer:
         print(f"\n=== Validation Loss Debug ===")
         print(f"val_logprobs shape: {val_logprobs.shape}, val_masks shape: {val_masks.shape}")
         print(f"val_advantages shape: {val_advantages.shape}")
+        print(f"val_logprobs contains NaN: {torch.isnan(val_logprobs).any()}")
+        print(f"val_advantages contains NaN: {torch.isnan(val_advantages).any()}")
+        print(f"val_masks sum: {val_masks.sum()}")
         
         if self.config.val_loss_type == 'sample-level-orig':
-            val_adv_expanded = val_advantages.unsqueeze(-1)
+            val_adv_expanded = val_advantages.unsqueeze(-1).detach()
             masked_term = val_adv_expanded * val_logprobs_new.to(torch.float32) * val_masks.detach()
             per_sample_num = val_masks.sum(dim=1).clamp(min=1)
             per_sample_sum = masked_term.sum(dim=1)
@@ -1374,24 +1334,18 @@ class GRPOTrainer:
             print(f'Validation loss (sample-level-orig): {validation_loss.item():.4f}')
             
         elif self.config.val_loss_type == 'rough-orig':
-            val_adv_expanded = val_advantages.unsqueeze(-1)
+            val_adv_expanded = val_advantages.unsqueeze(-1).detach()
             validation_loss = -torch.mean(val_adv_expanded * val_logprobs_new.to(torch.float32) * val_masks.detach())
             print(f'Validation loss (rough-orig): {validation_loss.item():.4f}')
             
         elif self.config.val_loss_type == 'seqloss-lastadv':
             seq_logprob = (val_logprobs_new.to(torch.float32) * val_masks.detach()).sum(dim=1)
-            seq_score = val_advantages
-            # CRITICAL: Validation loss sign matches PPO implementation
-            # Negative sign means: minimize -logprob*score = maximize logprob*score
-            # For positive advantages (good samples), we want to maximize logprobs
-            # Gradient will point in direction to increase logprobs for positive advantages
+            seq_score = val_advantages.detach()
             per_seq_loss = -seq_logprob * seq_score
             validation_loss = per_seq_loss.mean()
             print(f'Validation loss (seqloss-lastadv): {validation_loss.item():.4f}')
             print(f'  seq_logprob range: [{seq_logprob.min():.4f}, {seq_logprob.max():.4f}]')
-            print(f'  seq_score (advantages) range: [{seq_score.min():.4f}, {seq_score.max():.4f}]')
-            print(f'  seq_score mean: {seq_score.mean():.4f} (positive = good, negative = bad)')
-            print(f'  per_seq_loss range: [{per_seq_loss.min():.4f}, {per_seq_loss.max():.4f}]')
+            print(f'  seq_score range: [{seq_score.min():.4f}, {seq_score.max():.4f}]')
             
         else:
             raise NotImplementedError(f"Validation loss type {self.config.val_loss_type} not implemented.")
@@ -1405,18 +1359,15 @@ class GRPOTrainer:
         print(f"================================\n")
         
         # Backward on validation loss (captures validation gradients via hooks)
-        # DEBUG: Log validation loss and gradient info
-        print(f'Validation loss before backward: {validation_loss.item():.4f}')
-        print(f'Validation loss requires_grad: {validation_loss.requires_grad}')
-        
+        self._record_ghost = True
         self.accelerator.backward(validation_loss)
-        self.optimizer.zero_grad()
         self._record_ghost = False
+        self.optimizer.zero_grad()
         
-        # DEBUG: Check validation gradient norms (if available)
+        # DEBUG: Check validation gradient norms
         if len(self._gAs) > 0:
             val_grad_norms = []
-            for name in list(self._gAs.keys())[:3]:  # Check first 3 layers
+            for name in list(self._gAs.keys())[:3]:
                 if len(self._gAs[name]) > 0:
                     gA_norm = torch.cat(self._gAs[name], dim=0).float().norm().item()
                     val_grad_norms.append(gA_norm)
@@ -1424,7 +1375,7 @@ class GRPOTrainer:
                 print(f'Validation gradient norms (first 3 layers): {val_grad_norms}')
         
         # Free validation tensors
-        del val_outputs, val_logits, val_logprobs_new, validation_loss, val_model_inputs
+        del validation_loss, val_logprobs_new, val_outputs, val_logits, val_model_inputs
         
         timing["time/grpo/validation_gradient"] = time.time() - t
         log_gpu_memory("After validation gradient capture", verbose=True)
@@ -1480,28 +1431,10 @@ class GRPOTrainer:
         print(f'  Mean: {np.mean(ghost_ip_array):.6f}, Std: {np.std(ghost_ip_array):.6f}')
         print(f'  Min: {np.min(ghost_ip_array):.6f}, Max: {np.max(ghost_ip_array):.6f}')
         
-        # NEW APPROACH: Use influence-weighted training instead of sample selection
-        # This ensures we train on ALL samples (same as standard GRPO) but weight by influence
-        # Compute influence weights: normalize to [0, 1] range with positive bias
-        influence_weights = torch.tensor(ghost_ip_array, device=self.current_device, dtype=torch.float32)
-        
-        # Shift and scale: positive influence → weight > 1, negative → weight < 1
-        # Using softmax-like normalization: weights = softmax(influence * temperature)
-        # This keeps all weights positive and differentiates based on influence
-        influence_temp = 1.0  # Temperature for scaling
-        influence_weights = torch.softmax(influence_weights * influence_temp, dim=0) * bs
-        # Clamp to reasonable range
-        influence_weights = torch.clamp(influence_weights, min=0.1, max=5.0)
-        
-        print(f'Influence weights: mean={influence_weights.mean():.4f}, std={influence_weights.std():.4f}')
-        print(f'  min={influence_weights.min():.4f}, max={influence_weights.max():.4f}')
-        
-        # Store influence weights in batch_dict for weighted training
-        batch_dict["influence_weights"] = influence_weights
-        
-        # For backward compatibility, still compute selected_ids (for logging)
+        # PPO-STYLE SAMPLE SELECTION: Select samples with positive influence
+        # This matches PPO TracIn exactly
         selected_ids = np.where(ghost_ip_array > 0)[0]
-        print(f'Number of samples with positive influence: {len(selected_ids)} / {bs}')
+        print(f'Number of selected samples (positive influence): {len(selected_ids)} / {bs}')
         
         # Save generated data if requested
         if gen_data_dir is not None:
@@ -1522,91 +1455,104 @@ class GRPOTrainer:
             print(f'File saved to {gen_data_dir}/grpo_tracin_samples_seed-{self.config.seed}_{self.save_cnt}.pt')
             self.save_cnt += 1
         
-        # NEW: Train on ALL samples with influence-weighted advantages
-        # This is the key change - instead of training on fewer samples,
-        # we train on all samples but weight their contribution by influence
-        all_stats = []
-        self.model.train()
-        
-        print(f"Training on ALL {bs} samples with influence-weighted advantages")
-        
-        for epoch in range(self.config.grpo_epochs):
-            # Shuffle ALL indices (not just selected)
-            indices = torch.randperm(bs)
+        # PPO-STYLE TRAINING: Train ONLY on selected samples
+        # This matches PPO TracIn exactly
+        if len(selected_ids) > 0:
+            sel_bs = len(selected_ids)
+            all_stats = []
+            self.model.train()
             
-            for start_idx in range(0, bs, self.config.mini_batch_size):
-                end_idx = min(start_idx + self.config.mini_batch_size, bs)
-                batch_indices = indices[start_idx:end_idx]
+            print(f"Training on {sel_bs} selected samples (positive influence)")
+            
+            for epoch in range(self.config.grpo_epochs):
+                # Shuffle selected indices
+                b_inds = np.random.permutation(selected_ids)
                 
-                # Get mini-batch data
-                mb_logprobs_old = batch_dict["logprobs"][batch_indices].detach()
-                mb_advantages = batch_dict["advantages_expanded"][batch_indices].detach()
-                mb_masks = batch_dict["masks"][batch_indices]
-                mb_queries = [batch_dict["queries"][i] for i in batch_indices]
-                mb_responses = [batch_dict["responses"][i] for i in batch_indices]
-                mb_influence_weights = batch_dict["influence_weights"][batch_indices]
-                
-                mb_model_inputs = {
-                    "input_ids": batch_dict["input_ids"][batch_indices],
-                    "attention_mask": batch_dict["attention_mask"][batch_indices],
-                }
-                
-                # Apply influence weights to advantages
-                # Higher weight for samples with positive influence
-                mb_weighted_advantages = mb_advantages * mb_influence_weights.unsqueeze(-1)
-                
-                # Forward pass
-                outputs = self.model(
-                    input_ids=mb_model_inputs["input_ids"],
-                    attention_mask=mb_model_inputs["attention_mask"],
-                )
-                logits = outputs.logits
-                
-                # Compute new log probs
-                mb_logprobs_new = self._compute_logprobs_consistent(
-                    logits, mb_queries, mb_responses, mb_model_inputs, max_response_len
-                )
-                
-                # Extract response logits
-                response_logits = self._extract_response_logits_consistent(
-                    logits, mb_queries, mb_responses, max_response_len
-                )
-                
-                # Compute loss with weighted advantages
-                pg_loss, stats = self.loss(
-                    mb_logprobs_old,
-                    response_logits,
-                    mb_logprobs_new,
-                    mb_masks,
-                    mb_weighted_advantages,
-                )
-                
-                # Backward pass
-                self.accelerator.backward(pg_loss)
-                
-                if self.config.max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config.max_grad_norm
-                    )
-                
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-                
-                # Convert stats tensors to CPU/scalars before storing
-                stats_cpu = {k: v.detach().cpu().item() if isinstance(v, torch.Tensor) else v for k, v in stats.items()}
-                all_stats.append(stats_cpu)
-                
-                # FREE mini-batch tensors immediately
-                del outputs, logits, mb_logprobs_new, response_logits, pg_loss
-                del mb_logprobs_old, mb_advantages, mb_masks, mb_model_inputs
-        
-        timing["time/grpo/optimization"] = time.time() - t
-        
-        # Memory cleanup after training loop
-        gc.collect()
-        torch.cuda.empty_cache()
-        log_gpu_memory("After training loop", verbose=True)
+                for backward_batch_start in range(0, sel_bs, self.config.backward_batch_size):
+                    backward_batch_end = backward_batch_start + self.config.backward_batch_size
+                    
+                    # PPO-style: drop last batch if smaller than batch size
+                    if backward_batch_end > sel_bs:
+                        break
+                    
+                    backward_batch_inds = b_inds[backward_batch_start:backward_batch_end]
+                    
+                    for mini_batch_start in range(0, self.config.backward_batch_size, self.config.mini_batch_size):
+                        mini_batch_end = mini_batch_start + self.config.mini_batch_size
+                        mini_batch_inds = backward_batch_inds[mini_batch_start:mini_batch_end]
+                        
+                        if len(mini_batch_inds) == 0:
+                            continue
+                        
+                        # Get mini-batch data
+                        mb_logprobs_old = batch_dict["logprobs"][mini_batch_inds].detach()
+                        mb_advantages = batch_dict["advantages_expanded"][mini_batch_inds].detach()
+                        mb_masks = batch_dict["masks"][mini_batch_inds]
+                        mb_queries = [batch_dict["queries"][i] for i in mini_batch_inds]
+                        mb_responses = [batch_dict["responses"][i] for i in mini_batch_inds]
+                        
+                        mb_model_inputs = {
+                            "input_ids": batch_dict["input_ids"][mini_batch_inds],
+                            "attention_mask": batch_dict["attention_mask"][mini_batch_inds],
+                        }
+                        
+                        # Forward pass
+                        with self.accelerator.accumulate(self.model):
+                            outputs = self.model(
+                                input_ids=mb_model_inputs["input_ids"],
+                                attention_mask=mb_model_inputs["attention_mask"],
+                            )
+                            logits = outputs.logits
+                            
+                            # Compute new log probs
+                            mb_logprobs_new = self._compute_logprobs_consistent(
+                                logits, mb_queries, mb_responses, mb_model_inputs, max_response_len
+                            )
+                            
+                            # Extract response logits
+                            response_logits = self._extract_response_logits_consistent(
+                                logits, mb_queries, mb_responses, max_response_len
+                            )
+                            
+                            # Compute loss
+                            pg_loss, stats = self.loss(
+                                mb_logprobs_old,
+                                response_logits,
+                                mb_logprobs_new,
+                                mb_masks,
+                                mb_advantages,
+                            )
+                            
+                            # Backward pass
+                            self.accelerator.backward(pg_loss)
+                            
+                            if self.config.max_grad_norm is not None:
+                                torch.nn.utils.clip_grad_norm_(
+                                    self.model.parameters(),
+                                    self.config.max_grad_norm
+                                )
+                            
+                            self.optimizer.step()
+                            self.optimizer.zero_grad()
+                            
+                            # Convert stats tensors to CPU/scalars before storing
+                            stats_cpu = {k: v.detach().cpu().item() if isinstance(v, torch.Tensor) else v for k, v in stats.items()}
+                            all_stats.append(stats_cpu)
+                            
+                            # FREE mini-batch tensors immediately
+                            del outputs, logits, mb_logprobs_new, response_logits, pg_loss
+                            del mb_logprobs_old, mb_advantages, mb_masks, mb_model_inputs
+            
+            timing["time/grpo/optimization"] = time.time() - t
+            
+            # Memory cleanup after training loop
+            gc.collect()
+            torch.cuda.empty_cache()
+            log_gpu_memory("After training loop", verbose=True)
+        else:
+            print("Warning: No samples with positive influence. Skipping training step.")
+            all_stats = [{"loss/policy": 0.0, "loss/total": 0.0}]
+            timing["time/grpo/optimization"] = time.time() - t
         
         # Aggregate stats (with safety check for empty list)
         # All stats are now scalars (converted to CPU in training loop)
