@@ -1381,11 +1381,17 @@ class GRPOTrainer:
         elif self.config.val_loss_type == 'seqloss-lastadv':
             seq_logprob = (val_logprobs_new.to(torch.float32) * val_masks.detach()).sum(dim=1)
             seq_score = val_advantages
+            # CRITICAL: Validation loss sign matches PPO implementation
+            # Negative sign means: minimize -logprob*score = maximize logprob*score
+            # For positive advantages (good samples), we want to maximize logprobs
+            # Gradient will point in direction to increase logprobs for positive advantages
             per_seq_loss = -seq_logprob * seq_score
             validation_loss = per_seq_loss.mean()
             print(f'Validation loss (seqloss-lastadv): {validation_loss.item():.4f}')
             print(f'  seq_logprob range: [{seq_logprob.min():.4f}, {seq_logprob.max():.4f}]')
-            print(f'  seq_score range: [{seq_score.min():.4f}, {seq_score.max():.4f}]')
+            print(f'  seq_score (advantages) range: [{seq_score.min():.4f}, {seq_score.max():.4f}]')
+            print(f'  seq_score mean: {seq_score.mean():.4f} (positive = good, negative = bad)')
+            print(f'  per_seq_loss range: [{per_seq_loss.min():.4f}, {per_seq_loss.max():.4f}]')
             
         else:
             raise NotImplementedError(f"Validation loss type {self.config.val_loss_type} not implemented.")
@@ -1399,9 +1405,23 @@ class GRPOTrainer:
         print(f"================================\n")
         
         # Backward on validation loss (captures validation gradients via hooks)
+        # DEBUG: Log validation loss and gradient info
+        print(f'Validation loss before backward: {validation_loss.item():.4f}')
+        print(f'Validation loss requires_grad: {validation_loss.requires_grad}')
+        
         self.accelerator.backward(validation_loss)
         self.optimizer.zero_grad()
         self._record_ghost = False
+        
+        # DEBUG: Check validation gradient norms (if available)
+        if len(self._gAs) > 0:
+            val_grad_norms = []
+            for name in list(self._gAs.keys())[:3]:  # Check first 3 layers
+                if len(self._gAs[name]) > 0:
+                    gA_norm = torch.cat(self._gAs[name], dim=0).float().norm().item()
+                    val_grad_norms.append(gA_norm)
+            if val_grad_norms:
+                print(f'Validation gradient norms (first 3 layers): {val_grad_norms}')
         
         # Free validation tensors
         del val_outputs, val_logits, val_logprobs_new, validation_loss, val_model_inputs
@@ -1448,8 +1468,32 @@ class GRPOTrainer:
         t = time.time()
         
         # Select samples with positive influence
-        selected_ids = np.where(np.array(ghost_ip) > 0)[0]
-        print(f'Number of selected samples (positive influence): {len(selected_ids)} / {bs}')
+        # CRITICAL: If most samples have negative influence, we might be selecting wrong samples
+        # Try multiple selection strategies and log statistics
+        ghost_ip_array = np.array(ghost_ip)
+        positive_count = np.sum(ghost_ip_array > 0)
+        negative_count = np.sum(ghost_ip_array < 0)
+        zero_count = np.sum(ghost_ip_array == 0)
+        
+        print(f'Influence score distribution:')
+        print(f'  Positive: {positive_count} ({100*positive_count/bs:.1f}%)')
+        print(f'  Negative: {negative_count} ({100*negative_count/bs:.1f}%)')
+        print(f'  Zero: {zero_count} ({100*zero_count/bs:.1f}%)')
+        print(f'  Mean: {np.mean(ghost_ip_array):.6f}, Std: {np.std(ghost_ip_array):.6f}')
+        print(f'  Min: {np.min(ghost_ip_array):.6f}, Max: {np.max(ghost_ip_array):.6f}')
+        
+        # Selection strategy: Use positive influence (standard TracIn)
+        # If too few samples selected (< 10%), try top-K instead
+        selected_ids = np.where(ghost_ip_array > 0)[0]
+        
+        # Fallback: If less than 10% selected, use top 50% by influence
+        if len(selected_ids) < max(1, int(0.1 * bs)):
+            print(f'WARNING: Only {len(selected_ids)} samples with positive influence (< 10%). Using top 50% instead.')
+            top_k = max(1, int(0.5 * bs))
+            selected_ids = np.argsort(ghost_ip_array)[-top_k:]
+            print(f'Selected top-{top_k} samples by influence (fallback strategy)')
+        else:
+            print(f'Number of selected samples (positive influence): {len(selected_ids)} / {bs}')
         
         # Save generated data if requested
         if gen_data_dir is not None:
@@ -1599,6 +1643,10 @@ class GRPOTrainer:
         stats["tracin/selection_ratio"] = len(selected_ids) / bs
         stats["tracin/mean_ip"] = np.mean(ghost_ip)
         stats["tracin/std_ip"] = np.std(ghost_ip)
+        stats["tracin/min_ip"] = np.min(ghost_ip)
+        stats["tracin/max_ip"] = np.max(ghost_ip)
+        stats["tracin/positive_ratio"] = np.sum(np.array(ghost_ip) > 0) / bs
+        stats["tracin/negative_ratio"] = np.sum(np.array(ghost_ip) < 0) / bs
         stats.update(timing)
         stats["time/grpo/total"] = time.time() - t0
         
