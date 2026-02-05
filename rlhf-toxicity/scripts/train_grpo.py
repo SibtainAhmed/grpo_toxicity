@@ -239,7 +239,7 @@ def get_reward_scores(reward_model, reward_tokenizer, texts, device):
     return scores_list
 
 
-def select_high_quality_validation_set(
+def select_random_validation_set(
     val_question_tensors,
     val_questions,
     grpo_trainer,
@@ -247,23 +247,26 @@ def select_high_quality_validation_set(
     reward_tokenizer,
     tokenizer,
     device,
-    pool_size=500,
-    top_k=16,
+    sample_size=64,
     generation_kwargs=None,
 ):
     """
-    Pre-select high-quality validation samples for TracIn.
+    Select RANDOM validation samples for TracIn (matching PPO's approach).
+    
+    CRITICAL INSIGHT: TracIn needs DIVERSE validation samples (good AND bad) 
+    to encode "direction of improvement". Quality filtering removes this contrast!
     
     Strategy:
-    1. Sample a large pool (pool_size) from validation dataset
-    2. Generate responses for all prompts in pool
-    3. Compute rewards (HIGHER = less toxic = better quality)
-    4. Select top-K samples with HIGHEST scores (least toxic = best quality)
+    1. Randomly sample from validation dataset (NO quality filtering!)
+    2. Generate responses for selected prompts
+    3. Compute rewards and advantages
+    4. Use ALL samples for TracIn (advantages will encode contrast)
     
-    Rationale:
-    - TracIn selects training samples that help improve validation performance
-    - If validation = high-quality samples, TracIn selects training that helps produce less toxic outputs
-    - This is the correct direction for toxicity reduction!
+    Why random instead of quality-based:
+    - With only high-quality samples, advantages don't encode "good vs bad"
+    - They just encode "slightly better vs slightly worse among all-good"
+    - This doesn't tell the model what TOXIC content looks like!
+    - Random sampling includes both good AND bad → proper contrast
     
     Args:
         val_question_tensors: All validation prompt tensors
@@ -273,8 +276,7 @@ def select_high_quality_validation_set(
         reward_tokenizer: Tokenizer for reward model
         tokenizer: Tokenizer for decoding
         device: Device to run on
-        pool_size: Number of prompts to evaluate (default: 500)
-        top_k: Number of samples to select (default: 16)
+        sample_size: Number of samples to select (default: 64, like PPO)
         generation_kwargs: Generation parameters
         
     Returns:
@@ -285,60 +287,51 @@ def select_high_quality_validation_set(
         - indices: Original indices in validation dataset
         - question_texts: Selected question texts
     """
-    print(f"\n=== Selecting High-Quality Validation Set (Least Toxic Samples) ===")
-    print(f"Pool size: {pool_size}, Top-K: {top_k}")
+    print(f"\n=== Selecting RANDOM Validation Set (Like PPO) ===")
+    print(f"Sample size: {sample_size} (NO quality filtering - includes good AND bad)")
     
-    # Step 1: Sample a large pool from validation dataset
-    pool_indices = torch.randperm(len(val_question_tensors))[:pool_size]
-    pool_queries = [val_question_tensors[idx].to(device) for idx in pool_indices]
-    pool_question_texts = [val_questions[idx] for idx in pool_indices]
+    # Step 1: RANDOMLY sample from validation dataset (no filtering!)
+    sample_size = min(sample_size, len(val_question_tensors))
+    selected_indices = torch.randperm(len(val_question_tensors))[:sample_size]
+    selected_queries = [val_question_tensors[idx].to(device) for idx in selected_indices]
+    selected_question_texts = [val_questions[idx] for idx in selected_indices]
     
-    print(f"Generating responses for {pool_size} prompts...")
+    print(f"Generating responses for {sample_size} randomly selected prompts...")
     
-    # Step 2: Generate responses for all prompts in pool
+    # Step 2: Generate responses for selected prompts
     with torch.no_grad():
-        pool_responses = grpo_trainer.generate(
-            pool_queries,
+        selected_responses = grpo_trainer.generate(
+            selected_queries,
             batch_size=64,  # Process in batches for efficiency
             return_prompt=False,
             **generation_kwargs
         )
     
     # Step 3: Compute rewards for all prompt-response pairs
-    print(f"Computing rewards for {pool_size} samples...")
-    pool_response_texts = tokenizer.batch_decode(pool_responses, skip_special_tokens=True)
-    pool_full_texts = [q + r for q, r in zip(pool_question_texts, pool_response_texts)]
-    pool_scores = get_reward_scores(reward_model, reward_tokenizer, pool_full_texts, device)
-    pool_scores_tensor = torch.tensor(pool_scores, device=device, dtype=torch.float32)
+    print(f"Computing rewards for {sample_size} samples...")
+    response_texts = tokenizer.batch_decode(selected_responses, skip_special_tokens=True)
+    full_texts = [q + r for q, r in zip(selected_question_texts, response_texts)]
+    scores = get_reward_scores(reward_model, reward_tokenizer, full_texts, device)
+    scores_tensor = torch.tensor(scores, device=device, dtype=torch.float32)
     
-    # Step 4: Select top-K samples with HIGHEST scores (least toxic = best quality)
-    # Higher score = less toxic = better quality
-    print(f"Selecting top-{top_k} samples (highest scores = least toxic = best quality)...")
-    _, top_k_indices = torch.topk(pool_scores_tensor, k=top_k, largest=True)  # largest=True = highest scores
-    
-    # Extract selected samples
-    selected_indices = pool_indices[top_k_indices.cpu()]
-    selected_queries = [pool_queries[i] for i in top_k_indices.cpu().tolist()]
-    selected_responses = [pool_responses[i] for i in top_k_indices.cpu().tolist()]
-    selected_scores = pool_scores_tensor[top_k_indices]
-    
-    print(f"Selected validation set:")
-    print(f"  Mean score: {selected_scores.mean():.4f} (higher = less toxic = better)")
-    print(f"  Score range: [{selected_scores.min():.4f}, {selected_scores.max():.4f}]")
-    print(f"  Pool mean: {pool_scores_tensor.mean():.4f}")
-    print(f"  Improvement: +{selected_scores.mean() - pool_scores_tensor.mean():.4f} points (higher = less toxic)")
+    # NO FILTERING! Use all samples as-is (this is critical for TracIn)
+    print(f"Validation set (RANDOM, no filtering):")
+    print(f"  Mean score: {scores_tensor.mean():.4f}")
+    print(f"  Std score: {scores_tensor.std():.4f}")
+    print(f"  Score range: [{scores_tensor.min():.4f}, {scores_tensor.max():.4f}]")
+    print(f"  This diversity is ESSENTIAL for TracIn to work!")
     
     # Clean up intermediate tensors
-    del pool_responses, pool_response_texts, pool_full_texts, pool_scores, pool_scores_tensor
+    del response_texts, full_texts, scores
     gc.collect()
     torch.cuda.empty_cache()
     
     return {
         'queries': selected_queries,
         'responses': selected_responses,
-        'scores': selected_scores,
+        'scores': scores_tensor,
         'indices': selected_indices,
-        'question_texts': [pool_question_texts[i] for i in top_k_indices.cpu().tolist()]
+        'question_texts': selected_question_texts
     }
 
 
@@ -524,14 +517,14 @@ def grpo_train_loop_with_validation(
     dataloader = grpo_trainer.dataloader
     device = grpo_trainer.current_device
     
-    # Pre-select high-quality validation set
+    # Select RANDOM validation set (like PPO - no quality filtering!)
+    # Larger validation set for stable gradient estimate
     val_sample_size = min(script_args.tracin_val_batch_size, len(val_question_tensors))
-    val_pool_size = max(500, val_sample_size * 10)  # Evaluate 10x more samples than we need
     val_regenerate_freq = 10  # Regenerate validation responses every N steps
     
-    # Initial validation selection: use quality-based selection (least toxic = highest reward)
+    # Initial validation selection: RANDOM samples (includes good AND bad!)
     print(f"\n=== Initial Validation Set Selection ===")
-    val_selected = select_high_quality_validation_set(
+    val_selected = select_random_validation_set(
         val_question_tensors=val_question_tensors,
         val_questions=val_questions,
         grpo_trainer=grpo_trainer,
@@ -539,8 +532,7 @@ def grpo_train_loop_with_validation(
         reward_tokenizer=reward_tokenizer,
         tokenizer=tokenizer,
         device=device,
-        pool_size=val_pool_size,
-        top_k=val_sample_size,
+        sample_size=val_sample_size,
         generation_kwargs=generation_kwargs,
     )
     
@@ -599,8 +591,8 @@ def grpo_train_loop_with_validation(
             gc.collect()
             torch.cuda.empty_cache()
             
-            # Re-select validation set (least toxic = highest reward, model may have improved, so regenerate)
-            val_selected = select_high_quality_validation_set(
+            # Re-select validation set (RANDOM samples - includes good AND bad!)
+            val_selected = select_random_validation_set(
                 val_question_tensors=val_question_tensors,
                 val_questions=val_questions,
                 grpo_trainer=grpo_trainer,
@@ -608,8 +600,7 @@ def grpo_train_loop_with_validation(
                 reward_tokenizer=reward_tokenizer,
                 tokenizer=tokenizer,
                 device=device,
-                pool_size=val_pool_size,
-                top_k=val_sample_size,
+                sample_size=val_sample_size,
                 generation_kwargs=generation_kwargs,
             )
             

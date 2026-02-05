@@ -112,32 +112,19 @@ For each training step:
 **Same as Standard GRPO** (see Standard GRPO document)
 
 **Additional step for TracIn:**
-- **Pre-select high-quality validation set** (NEW! Quality-based selection)
+- **Select RANDOM validation set** (matching PPO's approach)
 - Generate validation responses for selected prompts
 - Compute validation rewards and advantages
 
 **Code location:** `train_grpo.py:523-572`
 
-#### Quality-Based Validation Selection
+#### RANDOM Validation Selection (CRITICAL for TracIn!)
 
-Instead of randomly selecting validation samples, we now use a **quality-based selection strategy**:
+⚠️ **IMPORTANT**: We use RANDOM selection, NOT quality-based filtering!
 
 ```python
-# Step 1: Sample a large pool from validation dataset (e.g., 500 prompts)
-val_pool_size = max(500, val_sample_size * 10)  # Evaluate 10x more than needed
-
-# Step 2: Generate responses for all prompts in pool
-pool_responses = grpo_trainer.generate(pool_queries, ...)
-
-# Step 3: Compute rewards (higher = less toxic = better)
-pool_scores = get_reward_scores(reward_model, reward_tokenizer, pool_full_texts, device)
-
-# Step 4: Select top-K samples with HIGHEST scores (best quality)
-_, top_k_indices = torch.topk(pool_scores_tensor, k=val_sample_size, largest=True)
-# largest=True because higher score = less toxic = better quality
-
-# Step 5: Use selected samples for TracIn
-val_selected = select_high_quality_validation_set(
+# RANDOM selection (includes good AND bad samples)
+val_selected = select_random_validation_set(
     val_question_tensors=val_question_tensors,
     val_questions=val_questions,
     grpo_trainer=grpo_trainer,
@@ -145,20 +132,32 @@ val_selected = select_high_quality_validation_set(
     reward_tokenizer=reward_tokenizer,
     tokenizer=tokenizer,
     device=device,
-    pool_size=val_pool_size,
-    top_k=val_sample_size,
+    sample_size=val_sample_size,  # e.g., 64 samples
     generation_kwargs=generation_kwargs,
 )
 ```
 
-**Why Quality-Based Selection?**
-- **Random selection** (old approach): May include low-quality samples → TracIn focuses on improving random performance
-- **Quality-based selection** (new approach): Selects high-quality samples → TracIn focuses on improving good performance
-- **Result**: Better generalization and faster convergence
+**Why RANDOM Selection (Not Quality-Based)?**
+
+TracIn needs **CONTRAST** between good and bad samples to work:
+
+```
+With RANDOM selection:
+├── Good samples (high reward) → positive advantage → gradient: "increase logprob"
+├── Bad samples (low reward) → negative advantage → gradient: "decrease logprob"
+└── Combined gradient = "DIRECTION OF IMPROVEMENT"
+
+With QUALITY filtering (WRONG!):
+├── All samples are "good" (high reward)
+├── Advantages just encode "slightly better vs slightly worse among all-good"
+└── NO information about what TOXIC content looks like!
+```
+
+**Key insight**: The validation gradient must encode CONTRAST between good and bad for TracIn to discriminate between helpful and harmful training samples.
 
 **Regeneration Strategy:**
-- Every 10 steps, re-select validation set (model may have improved)
-- Allows validation set to adapt to model improvements
+- Every 10 steps, re-select validation set (random sample)
+- Allows validation set to refresh with new diverse samples
 
 ---
 
@@ -649,43 +648,50 @@ for tracin_batch_start in range(0, self.config.val_size, self.config.tracin_val_
     # val_size = 1024, tracin_val_batch_size = 8 → 128 batches
 ```
 
-### GRPO TracIn Validation Strategy (Our Approach)
+### GRPO TracIn Validation Strategy (Current Approach)
 
-**GRPO TracIn** uses a **response-quality-based selection**:
+**GRPO TracIn** now uses **RANDOM selection** (matching PPO):
 
 1. **Dataset Separation**: Same as PPO (separates at initialization)
-2. **Response-Based Selection**: Selects validation **samples** (prompt + response) based on response quality:
-   - Samples a large pool (e.g., 500 prompts)
-   - Generates responses for all prompts
-   - Computes rewards (higher = less toxic = better)
-   - Selects top-K with **highest scores** (best quality)
-3. **Subset Selection**: Uses only selected subset (e.g., 16 samples) for TracIn computation
-4. **Quality Filtering**: Filters based on response quality after generation
+2. **RANDOM Selection**: Randomly samples from validation dataset:
+   - NO quality filtering!
+   - Includes both good AND bad samples
+   - This CONTRAST is essential for TracIn
+3. **Larger Validation Set**: Uses 64+ samples for stable gradient estimate
+4. **Periodic Regeneration**: Refreshes validation set every 10 steps
 
-### Key Differences
+### Key Differences (After Fix)
 
 | Aspect | PPO TracIn | GRPO TracIn |
 |--------|------------|-------------|
-| **Selection timing** | At initialization (prompt-based) | After generation (response-based) |
-| **Selection criterion** | Prompt toxicity (`val_strategy`) | Response quality (reward scores) |
-| **Validation set size** | Full set (e.g., 1024) - uses ALL | Selected subset (e.g., 16) - uses top-K |
-| **Quality focus** | Prompt toxicity (may select toxic prompts) | Response quality (selects best responses) |
-| **Adaptation** | Fixed throughout training | Regenerates every 10 steps |
-| **Subset selection** | No - uses entire validation set | Yes - selects top-K from pool |
+| **Selection method** | Random from test split | Random from validation |
+| **Validation set size** | 1024 samples | 64 samples |
+| **Quality filtering** | NO (uses all) | NO (uses all) |
+| **Diversity** | Good AND bad samples | Good AND bad samples |
+| **Advantage computation** | GAE with value function | Batch-normalized rewards |
+| **Regeneration** | No | Every 10 steps |
 
-### Why GRPO's Approach is Better
+### Why RANDOM Selection is Essential
 
-1. **Response Quality Matters**: TracIn measures influence on validation **performance**, which depends on response quality, not prompt toxicity
-2. **Quality-Based Selection**: Selects samples with highest reward scores (least toxic responses) → TracIn focuses on improving good performance
-3. **Adaptive**: Regenerates validation set periodically to adapt to model improvements
-4. **Efficient**: Uses smaller subset (16 vs 1024) while maintaining quality
+TracIn needs **CONTRAST** to work:
 
-### PPO's `val_strategy='top'` Issue
+```
+RANDOM selection (CORRECT):
+├── Good samples → positive advantage → "increase logprob for these"
+├── Bad samples → negative advantage → "decrease logprob for these"
+└── Gradient encodes: "direction of improvement"
 
-PPO's `val_strategy='top'` selects **most toxic prompts**, which is counterproductive:
-- Most toxic prompts → Model generates toxic responses → Low reward scores
-- TracIn focuses on improving performance on low-quality samples
-- **Better approach**: Select prompts that lead to high-quality responses (what GRPO does)
+QUALITY filtering (WRONG!):
+├── All samples are good → no negative advantages
+├── Gradient just says "produce these specific outputs"
+└── NO discrimination between toxic and non-toxic CONTENT!
+```
+
+### The Critical Insight
+
+**TracIn selects training samples that move the model in the same direction as the validation gradient.**
+
+If the validation gradient doesn't encode "improve quality" (because all validation samples are already good), TracIn can't discriminate between helpful and harmful training samples!
 
 ### When to Use Each
 
@@ -727,7 +733,12 @@ PPO's `val_strategy='top'` selects **most toxic prompts**, which is counterprodu
 - Hook-based gradient capture (memory-efficient)
 - Sequence-length independent gradient reconstruction (efficient matrix operations)
 - Validation-guided sample selection (better generalization)
-- **Quality-based validation selection** (selects high-quality responses, not random/prompt-based)
+- **RANDOM validation selection** (matching PPO - includes good AND bad for contrast)
+
+**Critical insight:**
+- TracIn needs CONTRAST between good and bad validation samples
+- Quality filtering removes this contrast → TracIn doesn't work!
+- Random selection preserves contrast → advantages encode "direction of improvement"
 
 ---
 
