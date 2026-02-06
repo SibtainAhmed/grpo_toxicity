@@ -486,18 +486,21 @@ def grpo_train_loop_with_validation(
     """
     GRPO training loop with TracIn influence-based sample selection.
     
+    IMPORTANT: Uses SAME-BATCH TracIn (like PPO's step_part_I)!
+    The training batch is used as its own validation set.
+    No separate validation set is needed.
+    
     This loop:
     1. Generates training responses
-    2. Generates validation responses (for TracIn gradient computation)
-    3. Computes per-sample influence scores via gradient inner products
-    4. Trains only on samples with positive influence
+    2. Computes per-sample influence scores using same-batch validation
+    3. Trains only on samples with positive influence
     """
     print("=" * 50)
-    print("Starting GRPO Training Loop with FULL TracIn")
+    print("Starting GRPO Training Loop with SAME-BATCH TracIn")
+    print("(Like PPO's step_part_I - training batch = validation batch)")
     print(f"Steps: {script_args.steps}")
     print(f"Batch size: {script_args.batch_size}")
     print(f"Num generations per prompt: {script_args.num_generations}")
-    print(f"Validation size: {len(val_question_tensors)}")
     print(f"TracIn batch size: {script_args.tracin_batch_size}")
     print(f"Val loss type: {script_args.val_loss_type}")
     print("=" * 50)
@@ -517,55 +520,11 @@ def grpo_train_loop_with_validation(
     dataloader = grpo_trainer.dataloader
     device = grpo_trainer.current_device
     
-    # Select RANDOM validation set (like PPO - no quality filtering!)
-    # Larger validation set for stable gradient estimate
-    val_sample_size = min(script_args.tracin_val_batch_size, len(val_question_tensors))
-    val_regenerate_freq = 10  # Regenerate validation responses every N steps
-    
-    # Initial validation selection: RANDOM samples (includes good AND bad!)
-    print(f"\n=== Initial Validation Set Selection ===")
-    val_selected = select_random_validation_set(
-        val_question_tensors=val_question_tensors,
-        val_questions=val_questions,
-        grpo_trainer=grpo_trainer,
-        reward_model=reward_model,
-        reward_tokenizer=reward_tokenizer,
-        tokenizer=tokenizer,
-        device=device,
-        sample_size=val_sample_size,
-        generation_kwargs=generation_kwargs,
-    )
-    
-    val_queries_batch = val_selected['queries']
-    val_responses_batch = val_selected['responses']
-    val_scores_tensor = val_selected['scores']
-    val_selected_indices = val_selected['indices']
-    
-    # Compute validation model inputs for gradient computation
-    val_model_inputs = grpo_trainer.prepare_model_inputs(val_queries_batch, val_responses_batch)
-    val_logprobs, val_masks = grpo_trainer.compute_logprobs(
-        grpo_trainer.model, val_queries_batch, val_responses_batch, val_model_inputs
-    )
-    
-    # FREE temporary tensors
-    del val_model_inputs
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    # Handle NaN in validation scores
-    if torch.isnan(val_scores_tensor).any():
-        print("WARNING: Validation scores contain NaN! Replacing with 0.")
-        val_scores_tensor = torch.nan_to_num(val_scores_tensor, nan=0.0)
-    
-    val_advantages = grpo_trainer.compute_group_advantages(val_scores_tensor, 1)  # No grouping for validation
-    
-    # Handle NaN in validation advantages
-    if torch.isnan(val_advantages).any():
-        print("WARNING: Validation advantages contain NaN! Replacing with 0.")
-        val_advantages = torch.nan_to_num(val_advantages, nan=0.0)
-    
-    print(f"Validation scores: mean={val_scores_tensor.mean():.4f}, std={val_scores_tensor.std():.4f}")
-    print(f"Validation advantages: mean={val_advantages.mean():.4f}, std={val_advantages.std():.4f}")
+    # NO SEPARATE VALIDATION SET NEEDED!
+    # We use same-batch TracIn (like PPO's step_part_I)
+    # The training batch serves as its own validation
+    print(f"\n=== Same-Batch TracIn Mode ===")
+    print(f"No separate validation set - using training batch as validation")
     
     epoch = 0
     all_ghost_ips = []  # Track influence scores across training
@@ -578,61 +537,7 @@ def grpo_train_loop_with_validation(
         timing = {}
         t0 = time.time()
         
-        # Periodically regenerate validation responses for diversity
-        if epoch % val_regenerate_freq == 0:
-            print(f"\n[Step {epoch}] Regenerating validation responses...")
-            
-            # FREE old validation tensors BEFORE creating new ones
-            try:
-                del val_responses_batch, val_logprobs, val_masks, val_advantages
-                del val_queries_batch, val_scores_tensor, val_selected_indices
-            except NameError:
-                pass  # First iteration or already deleted
-            gc.collect()
-            torch.cuda.empty_cache()
-            
-            # Re-select validation set (RANDOM samples - includes good AND bad!)
-            val_selected = select_random_validation_set(
-                val_question_tensors=val_question_tensors,
-                val_questions=val_questions,
-                grpo_trainer=grpo_trainer,
-                reward_model=reward_model,
-                reward_tokenizer=reward_tokenizer,
-                tokenizer=tokenizer,
-                device=device,
-                sample_size=val_sample_size,
-                generation_kwargs=generation_kwargs,
-            )
-            
-            val_queries_batch = val_selected['queries']
-            val_responses_batch = val_selected['responses']
-            val_scores_tensor = val_selected['scores']
-            val_selected_indices = val_selected['indices']
-            
-            # Compute validation model inputs for gradient computation
-            val_model_inputs = grpo_trainer.prepare_model_inputs(val_queries_batch, val_responses_batch)
-            val_logprobs, val_masks = grpo_trainer.compute_logprobs(
-                grpo_trainer.model, val_queries_batch, val_responses_batch, val_model_inputs
-            )
-            
-            # FREE temporary tensors
-            del val_model_inputs
-            gc.collect()
-            torch.cuda.empty_cache()
-            
-            # Handle NaN in validation scores
-            if torch.isnan(val_scores_tensor).any():
-                print("WARNING: Validation scores contain NaN! Replacing with 0.")
-                val_scores_tensor = torch.nan_to_num(val_scores_tensor, nan=0.0)
-            
-            val_advantages = grpo_trainer.compute_group_advantages(val_scores_tensor, 1)
-            
-            # Handle NaN in validation advantages
-            if torch.isnan(val_advantages).any():
-                print("WARNING: Validation advantages contain NaN! Replacing with 0.")
-                val_advantages = torch.nan_to_num(val_advantages, nan=0.0)
-            
-            print(f"New validation scores: mean={val_scores_tensor.mean():.4f}")
+        # No validation regeneration needed - using same-batch TracIn!
         
         # Get query tensors
         question_tensors = batch["input_ids"]
@@ -673,18 +578,12 @@ def grpo_train_loop_with_validation(
         scores = get_reward_scores(reward_model, reward_tokenizer, full_texts, device)
         timing["time/grpo/reward"] = time.time() - t
         
-        # Run GRPO TracIn step
+        # Run GRPO TracIn step (same-batch TracIn - no validation data needed!)
         t = time.time()
         stats, ghost_ip = grpo_trainer.step_tracin(
             queries=all_queries,
             responses=all_responses,
             scores=scores,
-            val_queries=val_queries_batch,
-            val_responses=val_responses_batch,
-            val_advantages=val_advantages,
-            val_logprobs=val_logprobs,
-            val_masks=val_masks,
-            val_scores=val_scores_tensor,  # Pass RAW SCORES for seqloss-reward
             gen_data_dir=script_args.gen_data_dir,
         )
         timing["time/grpo/step"] = time.time() - t

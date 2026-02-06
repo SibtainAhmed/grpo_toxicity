@@ -1,8 +1,10 @@
-# GRPO TracIn: Root Cause Analysis
+# GRPO TracIn: Root Cause Analysis & Fix
 
 ## The Problem
 
-TracIn is not working in GRPO - model isn't learning, no reward improvement, no variance decrease.
+TracIn was not working in GRPO - model wasn't learning, no reward improvement, no variance decrease.
+
+**Standard GRPO works fine. The issue was specifically with the TracIn implementation.**
 
 ## TracIn Core Concept
 
@@ -13,11 +15,30 @@ influence(train_sample) = ⟨∇L_train, ∇L_val⟩
 - **Positive influence**: Training sample helps validation → SELECT
 - **Negative influence**: Training sample hurts validation → SKIP
 
-**For this to work, the validation gradient must represent the "direction of improvement."**
+---
+
+## ✅ THE FIX: Same-Batch TracIn (Like PPO's step_part_I)
+
+The key insight is that **PPO uses the SAME training batch as validation** in `step_part_I`.
+This is fundamentally different from using a separate validation set!
+
+```
+PPO's step_part_I:
+1. Training batch = Validation batch (SAME data!)
+2. Compute training gradients for each sample
+3. Compute validation loss using SAME batch's advantages
+4. Select samples that help the batch be self-consistent
+```
+
+**Why this works:**
+- Training and validation are always in sync
+- Advantages are fresh and relevant to current model
+- No stale validation data problem
+- Selects samples that improve self-consistency
 
 ---
 
-## 🔴 ROOT CAUSE: Validation Gradient Doesn't Encode "Improvement"
+## 🔴 ORIGINAL PROBLEM: Separate Validation Set Doesn't Work for RL
 
 ### What the Validation Gradient Should Represent
 
