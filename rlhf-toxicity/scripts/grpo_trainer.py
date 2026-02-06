@@ -1297,26 +1297,38 @@ class GRPOTrainer:
         # Part III: Capture VALIDATION gradients using SAME BATCH (like PPO step_part_I)
         # =====================
         # KEY INSIGHT: Use the TRAINING BATCH as validation!
-        # This is what PPO's step_part_I does and it works much better for RL.
-        # The validation loss is computed on the SAME data we just computed training gradients for.
+        # We need a FRESH forward pass because training backward consumed the graph.
         t = time.time()
         
-        # Clear gradient buffers (keep activations from training forward pass)
-        # This matches PPO's step_part_I line 1222-1223
-        for buf in (self._gAs, self._gBs):
+        # Clear gradient buffers (keep activations from training in _train_* buffers)
+        for buf in (self._xs, self._hs, self._gAs, self._gBs):
             for name in buf:
                 buf[name] = []
         
-        # Compute validation loss using SAME BATCH data (like PPO step_part_I)
-        # Use the logprobs and advantages we already computed for training
+        # FRESH forward pass for validation (needed because training backward consumed the graph)
         print(f"\n=== Validation Loss (Same-Batch TracIn) ===")
         print(f"Using TRAINING batch as validation (like PPO step_part_I)")
-        print(f"logprobs shape: {logprobs.shape}, masks shape: {masks.shape}")
+        print(f"Running fresh forward pass for validation gradient...")
+        
+        self._record_ghost = True
+        val_outputs = self.model(
+            input_ids=model_inputs["input_ids"],
+            attention_mask=model_inputs["attention_mask"],
+        )
+        val_logits = val_outputs.logits
+        self._record_ghost = False
+        
+        # Compute fresh logprobs from this forward pass
+        val_logprobs = self._compute_logprobs_consistent(
+            val_logits, queries, responses, model_inputs, max_response_len
+        )
+        
+        print(f"val_logprobs shape: {val_logprobs.shape}, masks shape: {masks.shape}")
         print(f"advantages shape: {advantages.shape}")
         
         # Use seqloss-lastadv style loss on training batch (like PPO line 1210-1216)
         if self.config.val_loss_type in ['seqloss-lastadv', 'seqloss-reward']:
-            seq_logprob = (logprobs.to(torch.float32) * masks.detach()).sum(dim=1)
+            seq_logprob = (val_logprobs.to(torch.float32) * masks.detach()).sum(dim=1)
             # Use batch advantages (already normalized, mean≈0)
             seq_score = advantages.detach()
             per_seq_loss = -seq_logprob * seq_score
@@ -1328,11 +1340,11 @@ class GRPOTrainer:
             
         elif self.config.val_loss_type == 'rough-orig':
             # Simple average loss (like PPO line 1206-1208)
-            validation_loss = -torch.mean(advantages_expanded.detach() * logprobs.to(torch.float32) * masks.detach())
+            validation_loss = -torch.mean(advantages_expanded.detach() * val_logprobs.to(torch.float32) * masks.detach())
             print(f'Validation loss (rough-orig): {validation_loss.item():.4f}')
             
         elif self.config.val_loss_type == 'sample-level-orig':
-            masked_term = advantages_expanded.detach() * logprobs.to(torch.float32) * masks.detach()
+            masked_term = advantages_expanded.detach() * val_logprobs.to(torch.float32) * masks.detach()
             per_sample_num = masks.sum(dim=1).clamp(min=1)
             per_sample_sum = masked_term.sum(dim=1)
             per_sample_loss = -per_sample_sum / per_sample_num
@@ -1341,13 +1353,13 @@ class GRPOTrainer:
             
         else:
             # Default: use rough-orig
-            validation_loss = -torch.mean(advantages_expanded.detach() * logprobs.to(torch.float32) * masks.detach())
+            validation_loss = -torch.mean(advantages_expanded.detach() * val_logprobs.to(torch.float32) * masks.detach())
             print(f'Validation loss (default rough-orig): {validation_loss.item():.4f}')
         
         # Check for NaN
         if torch.isnan(validation_loss) or torch.isinf(validation_loss):
             print(f"ERROR: Validation loss is NaN/Inf! Using fallback loss.")
-            validation_loss = -torch.mean(logprobs.to(torch.float32) * masks.detach())
+            validation_loss = -torch.mean(val_logprobs.to(torch.float32) * masks.detach())
         
         print(f"Validation loss final: {validation_loss.item():.4f}")
         print(f"================================\n")
@@ -1368,8 +1380,8 @@ class GRPOTrainer:
             if val_grad_norms:
                 print(f'Validation gradient norms (first 3 layers): {val_grad_norms}')
         
-        # Free validation loss tensor
-        del validation_loss
+        # Free validation tensors
+        del validation_loss, val_logprobs, val_outputs, val_logits
         
         timing["time/grpo/validation_gradient"] = time.time() - t
         log_gpu_memory("After validation gradient capture", verbose=True)
