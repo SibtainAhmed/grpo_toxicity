@@ -771,6 +771,53 @@ class GRPOTrainer:
         
         return torch.stack(padded_logprobs), torch.stack(padded_masks)
 
+    def _compute_logprobs_from_logits(self, logits, queries, responses, model_inputs):
+        """
+        Compute log probabilities from pre-computed logits (no forward pass).
+        This is used when we already have logits from a forward pass and want to reuse them.
+        """
+        input_ids = model_inputs["input_ids"]
+        
+        # Get log probs for response tokens only
+        all_logprobs = []
+        all_masks = []
+        
+        for i, (query, response) in enumerate(zip(queries, responses)):
+            query_len = len(query)
+            response_len = len(response)
+            
+            # Get logits for this sequence
+            seq_logits = logits[i]
+            
+            # Compute log probs
+            log_probs = F.log_softmax(seq_logits, dim=-1)
+            
+            # Get response token log probs (shift by 1 for autoregressive)
+            response_start = query_len
+            response_end = query_len + response_len
+            
+            # Get log probs of actual tokens
+            response_logprobs = torch.gather(
+                log_probs[response_start-1:response_end-1],
+                dim=-1,
+                index=input_ids[i, response_start:response_end].unsqueeze(-1)
+            ).squeeze(-1)
+            
+            all_logprobs.append(response_logprobs)
+            all_masks.append(torch.ones_like(response_logprobs))
+        
+        # Pad to same length
+        max_len = max(lp.shape[0] for lp in all_logprobs)
+        padded_logprobs = []
+        padded_masks = []
+        
+        for lp, mask in zip(all_logprobs, all_masks):
+            pad_len = max_len - lp.shape[0]
+            padded_logprobs.append(F.pad(lp, (0, pad_len), value=0))
+            padded_masks.append(F.pad(mask, (0, pad_len), value=0))
+        
+        return torch.stack(padded_logprobs), torch.stack(padded_masks)
+
     def _extract_response_logits(self, logits, queries, responses):
         """
         Extract only the response portion of logits for entropy computation.
@@ -1177,10 +1224,18 @@ class GRPOTrainer:
         self._clear_ghost_buffers()
         
         # Forward pass with ghost recording enabled (captures activations for training)
+        # CRITICAL: Store logits from this forward pass - we'll use them for BOTH training gradients AND validation loss
         t = time.time()
         self._record_ghost = True
-        logprobs, masks = self.compute_logprobs(self.model, queries, responses, model_inputs)
+        outputs = self.model(
+            input_ids=model_inputs["input_ids"],
+            attention_mask=model_inputs["attention_mask"],
+        )
+        logits = outputs.logits
         self._record_ghost = False
+        
+        # Compute logprobs from the stored logits (same forward pass)
+        logprobs, masks = self._compute_logprobs_from_logits(logits, queries, responses, model_inputs)
         
         # Get reference log probs
         with torch.no_grad():
@@ -1218,10 +1273,12 @@ class GRPOTrainer:
             val_advantages_batch = torch.nan_to_num(val_advantages_batch, nan=0.0)
         
         # Prepare batch dict
+        # CRITICAL: Store logits from the initial forward pass - we'll use them for training gradients
         batch_dict = {
             "queries": queries,
             "responses": responses,
             "logprobs": logprobs.to(torch.float32),
+            "logits": logits.to(torch.float32),  # Store logits from initial forward pass
             "masks": masks,
             "advantages": advantages,
             "advantages_expanded": advantages_expanded,
@@ -1242,12 +1299,15 @@ class GRPOTrainer:
         self._record_ghost = True
         
         # Process training samples in batches with ghost_mode (no weight updates)
+        # CRITICAL: Use SAME logprobs/logits from initial forward pass (like PPO does!)
+        # This ensures training gradients and validation loss use consistent activations
         for tracin_batch_start in range(0, bs, self.config.tracin_batch_size):
             tracin_batch_end = min(tracin_batch_start + self.config.tracin_batch_size, bs)
             tracin_batch_inds = np.arange(tracin_batch_start, tracin_batch_end)
             
             tracin_batch_dict = {
-                "logprobs": batch_dict["logprobs"][tracin_batch_inds],
+                "logprobs": batch_dict["logprobs"][tracin_batch_inds],  # Use SAME logprobs from initial forward pass
+                "logits": batch_dict["logits"][tracin_batch_inds],  # Use SAME logits from initial forward pass
                 "masks": batch_dict["masks"][tracin_batch_inds],
                 "queries": [batch_dict["queries"][i] for i in tracin_batch_inds],
                 "responses": [batch_dict["responses"][i] for i in tracin_batch_inds],
@@ -1257,39 +1317,27 @@ class GRPOTrainer:
             for k in model_inputs_names:
                 tracin_batch_dict[k] = batch_dict[k][tracin_batch_inds]
             
-            mb_model_inputs = {k: tracin_batch_dict[k] for k in model_inputs_names}
-            
-            # Forward pass (hooks capture activations)
-            outputs = self.model(
-                input_ids=mb_model_inputs["input_ids"],
-                attention_mask=mb_model_inputs["attention_mask"],
-            )
-            logits = outputs.logits
-            
-            # Compute new log probs
-            mb_logprobs_new = self._compute_logprobs_consistent(
-                logits, tracin_batch_dict["queries"], tracin_batch_dict["responses"],
-                mb_model_inputs, max_response_len
-            )
-            
-            # Extract response logits for entropy
+            # Extract response logits for entropy (from stored logits)
+            mb_logits = tracin_batch_dict["logits"]
+            mb_logprobs = tracin_batch_dict["logprobs"]
             response_logits = self._extract_response_logits_consistent(
-                logits, tracin_batch_dict["queries"], tracin_batch_dict["responses"],
+                mb_logits, tracin_batch_dict["queries"], tracin_batch_dict["responses"],
                 max_response_len
             )
             
-            # Compute loss for the batch
+            # Compute loss for the batch using SAME logprobs/logits from initial forward pass
             pg_loss, _ = self.loss(
-                tracin_batch_dict["logprobs"].detach(),
-                response_logits,
-                mb_logprobs_new,
+                tracin_batch_dict["logprobs"].detach(),  # old_logprobs (from initial forward pass)
+                response_logits,  # logits (from initial forward pass)
+                mb_logprobs,  # new logprobs (SAME as old - from initial forward pass)
                 tracin_batch_dict["masks"].detach(),
                 tracin_batch_dict["advantages_expanded"].detach(),
             )
             
             # Backward with ghost_mode (captures gradients via hooks but doesn't update weights)
+            # CRITICAL: Use retain_graph=True so graph persists for validation backward (like PPO)
             with ghost_mode(self.optimizer):
-                self.accelerator.backward(pg_loss, retain_graph=False)
+                self.accelerator.backward(pg_loss, retain_graph=True)
                 self.optimizer.zero_grad()
         
         self._record_ghost = False
@@ -1303,8 +1351,9 @@ class GRPOTrainer:
         # =====================
         # Part III: Capture VALIDATION gradients using SAME BATCH (like PPO step_part_I)
         # =====================
-        # KEY INSIGHT: Use the TRAINING BATCH as validation!
-        # We need a FRESH forward pass because training backward consumed the graph.
+        # KEY INSIGHT: Use the SAME logprobs from initial forward pass for validation loss!
+        # PPO does this - it uses all_logprobs from the initial forward pass for validation loss.
+        # We use retain_graph=True in training backward, so the graph is still available.
         t = time.time()
         
         # Clear gradient buffers (keep activations from training in _train_* buffers)
@@ -1312,23 +1361,13 @@ class GRPOTrainer:
             for name in buf:
                 buf[name] = []
         
-        # FRESH forward pass for validation (needed because training backward consumed the graph)
         print(f"\n=== Validation Loss (Same-Batch TracIn) ===")
-        print(f"Using TRAINING batch as validation (like PPO step_part_I)")
-        print(f"Running fresh forward pass for validation gradient...")
+        print(f"Using SAME logprobs from initial forward pass (like PPO step_part_I)")
+        print(f"No new forward pass needed - using batch_dict['logprobs']")
         
-        self._record_ghost = True
-        val_outputs = self.model(
-            input_ids=model_inputs["input_ids"],
-            attention_mask=model_inputs["attention_mask"],
-        )
-        val_logits = val_outputs.logits
-        self._record_ghost = False
-        
-        # Compute fresh logprobs from this forward pass
-        val_logprobs = self._compute_logprobs_consistent(
-            val_logits, queries, responses, model_inputs, max_response_len
-        )
+        # CRITICAL: Use SAME logprobs from initial forward pass (like PPO does!)
+        # PPO uses all_logprobs from the initial forward pass for validation loss (line 1196-1216)
+        val_logprobs = batch_dict["logprobs"]  # Use SAME logprobs from initial forward pass
         
         print(f"val_logprobs shape: {val_logprobs.shape}, masks shape: {masks.shape}")
         print(f"advantages (group) shape: {advantages.shape}")
@@ -1376,6 +1415,7 @@ class GRPOTrainer:
         print(f"================================\n")
         
         # Backward on validation loss (captures validation gradients via hooks)
+        # CRITICAL: The graph from initial forward pass is still available because we used retain_graph=True
         self._record_ghost = True
         self.accelerator.backward(validation_loss)
         self._record_ghost = False
@@ -1392,7 +1432,7 @@ class GRPOTrainer:
                 print(f'Validation gradient norms (first 3 layers): {val_grad_norms}')
         
         # Free validation tensors
-        del validation_loss, val_logprobs, val_outputs, val_logits
+        del validation_loss
         
         timing["time/grpo/validation_gradient"] = time.time() - t
         log_gpu_memory("After validation gradient capture", verbose=True)
