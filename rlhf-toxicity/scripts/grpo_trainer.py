@@ -1204,11 +1204,18 @@ class GRPOTrainer:
         rewards, non_score_reward = self.compute_rewards_with_kl(scores_tensor, logprobs.detach(), ref_logprobs, masks)
         timing["time/grpo/compute_rewards"] = time.time() - t
         
-        # Compute group-relative advantages
+        # Compute group-relative advantages (GRPO training objective)
         t = time.time()
         advantages = self.compute_group_advantages(scores_tensor, self.config.num_generations)
         advantages_expanded = advantages.unsqueeze(-1).expand_as(logprobs)
         timing["time/grpo/compute_advantages"] = time.time() - t
+
+        # TracIn validation signal should use BATCH-level advantages (not per-group)
+        # This avoids within-group mean-zero cancellation and provides a stronger signal.
+        val_advantages_batch = self.compute_group_advantages(scores_tensor, 1)
+        if torch.isnan(val_advantages_batch).any():
+            print("WARNING: val_advantages_batch contains NaN! Replacing with 0.")
+            val_advantages_batch = torch.nan_to_num(val_advantages_batch, nan=0.0)
         
         # Prepare batch dict
         batch_dict = {
@@ -1324,27 +1331,30 @@ class GRPOTrainer:
         )
         
         print(f"val_logprobs shape: {val_logprobs.shape}, masks shape: {masks.shape}")
-        print(f"advantages shape: {advantages.shape}")
+        print(f"advantages (group) shape: {advantages.shape}")
+        print(f"val_advantages_batch shape: {val_advantages_batch.shape}")
         
         # Use seqloss-lastadv style loss on training batch (like PPO line 1210-1216)
         if self.config.val_loss_type in ['seqloss-lastadv', 'seqloss-reward']:
             seq_logprob = (val_logprobs.to(torch.float32) * masks.detach()).sum(dim=1)
-            # Use batch advantages (already normalized, mean≈0)
-            seq_score = advantages.detach()
+            # Use batch-level advantages for TracIn validation signal
+            seq_score = val_advantages_batch.detach()
             per_seq_loss = -seq_logprob * seq_score
             validation_loss = per_seq_loss.mean()
             print(f'Validation loss (same-batch seqloss): {validation_loss.item():.4f}')
             print(f'  seq_logprob range: [{seq_logprob.min():.4f}, {seq_logprob.max():.4f}]')
-            print(f'  seq_score (advantages) range: [{seq_score.min():.4f}, {seq_score.max():.4f}]')
-            print(f'  advantages mean: {advantages.mean():.4f}, std: {advantages.std():.4f}')
+            print(f'  seq_score (val_advantages_batch) range: [{seq_score.min():.4f}, {seq_score.max():.4f}]')
+            print(f'  val_advantages_batch mean: {val_advantages_batch.mean():.4f}, std: {val_advantages_batch.std():.4f}')
             
         elif self.config.val_loss_type == 'rough-orig':
             # Simple average loss (like PPO line 1206-1208)
-            validation_loss = -torch.mean(advantages_expanded.detach() * val_logprobs.to(torch.float32) * masks.detach())
+            val_adv_expanded = val_advantages_batch.unsqueeze(-1).detach()
+            validation_loss = -torch.mean(val_adv_expanded * val_logprobs.to(torch.float32) * masks.detach())
             print(f'Validation loss (rough-orig): {validation_loss.item():.4f}')
             
         elif self.config.val_loss_type == 'sample-level-orig':
-            masked_term = advantages_expanded.detach() * val_logprobs.to(torch.float32) * masks.detach()
+            val_adv_expanded = val_advantages_batch.unsqueeze(-1).detach()
+            masked_term = val_adv_expanded * val_logprobs.to(torch.float32) * masks.detach()
             per_sample_num = masks.sum(dim=1).clamp(min=1)
             per_sample_sum = masked_term.sum(dim=1)
             per_sample_loss = -per_sample_sum / per_sample_num
@@ -1353,7 +1363,8 @@ class GRPOTrainer:
             
         else:
             # Default: use rough-orig
-            validation_loss = -torch.mean(advantages_expanded.detach() * val_logprobs.to(torch.float32) * masks.detach())
+            val_adv_expanded = val_advantages_batch.unsqueeze(-1).detach()
+            validation_loss = -torch.mean(val_adv_expanded * val_logprobs.to(torch.float32) * masks.detach())
             print(f'Validation loss (default rough-orig): {validation_loss.item():.4f}')
         
         # Check for NaN
