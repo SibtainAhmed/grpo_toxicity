@@ -1,5 +1,5 @@
 #!/bin/bash
-# GRPO Training Script with TracIn (Influence Function) for Toxicity Reduction
+# GRPO Training Script (Codex) with TracIn (Influence Function) for Toxicity Reduction
 #
 # KEY CHANGE: SAME-BATCH TracIn (like PPO's step_part_I)
 # - Uses the TRAINING BATCH as its own validation (no separate validation set!)
