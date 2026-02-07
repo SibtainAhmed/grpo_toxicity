@@ -1,26 +1,25 @@
 #!/bin/bash
 # GRPO Training Script with TracIn (Influence Function) for Toxicity Reduction
 #
-# KEY CHANGE: SAME-BATCH TracIn (like PPO's step_part_I)
-# - Uses the TRAINING BATCH as its own validation (no separate validation set!)
-# - This is what makes PPO TracIn work well
-# - Training and validation are always in sync
-# - No stale validation data problem
+# KEY CHANGES (GROUP-LEVEL TracIn):
+# 1. GROUP-LEVEL SELECTION: In GRPO, each prompt produces num_generations
+#    responses forming a contrastive group (good vs bad). Per-sample selection
+#    breaks this structure. We now select/reject ENTIRE prompt groups based on
+#    the sum of per-sample influence scores within the group.
 #
-# Why same-batch TracIn works:
-# - In RL, the "good" behavior changes as model improves
-# - Fixed validation sets become outdated quickly
-# - Using same batch ensures validation is always current and relevant
-# - PPO's step_part_I does exactly this and it works!
+# 2. MATCHING VALIDATION LOSS: PPO step_part_I uses the SAME loss formulation
+#    (token-level, same advantages) for validation as training. We now do too:
+#    val_loss = -mean(advantages_expanded * logprobs * masks)  (rough-orig)
+#    using the SAME group-level advantages as training.
+#
+# Same-batch TracIn (like PPO step_part_I): training batch = validation batch.
 #
 # OPTIMIZED for A100 80GB with hook-based TracIn (memory efficient):
-# - batch_size=64: Larger main batch (64 prompts x 8 gens = 512 samples)
+# - batch_size=64: 8 prompts x 8 gens = 64 samples
 # - tracin_batch_size=32: Process 32 samples at a time for gradient computation
 # - mini_batch_size=32: Larger training mini-batches
 # - gen_bsize=128: Larger generation batch for better GPU utilization
 # - num_generations=8: SAME AS STANDARD for fair comparison
-#
-# Note: Hook-based approach reuses computational graphs, preventing memory leaks.
 
 set -x
 accelerate launch --main_process_port=29525 \
@@ -55,5 +54,5 @@ accelerate launch --main_process_port=29525 \
     --run_name="grpo-tracin-2.7b-fp16-kl-0.04-samebatch_gen-8_mbs-32_seed-22" \
     --tracin \
     --with_validation \
-    --val_loss_type="seqloss-lastadv" \
+    --val_loss_type="rough-orig" \
     --gen_data_dir="gen_tox_grpo_samples_tracin_2.7b_fp16_kl-0.04_samebatch_gen-8_mbs-32_seed-22"

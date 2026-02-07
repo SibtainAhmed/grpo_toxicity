@@ -1111,78 +1111,68 @@ class GRPOTrainer:
         queries: List[torch.LongTensor],
         responses: List[torch.LongTensor],
         scores: List[torch.FloatTensor],
-        val_queries: List[torch.LongTensor] = None,  # NOT USED - kept for API compatibility
-        val_responses: List[torch.LongTensor] = None,  # NOT USED
-        val_advantages: torch.FloatTensor = None,  # NOT USED
-        val_logprobs: torch.FloatTensor = None,  # NOT USED
-        val_masks: torch.FloatTensor = None,  # NOT USED
-        val_scores: torch.FloatTensor = None,  # NOT USED
+        val_queries: List[torch.LongTensor] = None,
+        val_responses: List[torch.LongTensor] = None,
+        val_advantages: torch.FloatTensor = None,
+        val_logprobs: torch.FloatTensor = None,
+        val_masks: torch.FloatTensor = None,
+        val_scores: torch.FloatTensor = None,
         gen_data_dir: str = None,
     ):
         """
-        Run a GRPO optimization step with TracIn influence-based sample selection.
+        GRPO TracIn with GROUP-LEVEL selection (preserves contrastive signal).
         
-        IMPORTANT: Uses SAME-BATCH TracIn (like PPO's step_part_I)!
-        The training batch is used as its own validation set.
-        This is more appropriate for RL than using a separate validation set.
+        KEY DIFFERENCES from previous per-sample approach:
         
-        Why same-batch TracIn works better:
-        1. Training and validation are always in sync (same batch)
-        2. Advantages are fresh and relevant to current model
-        3. Selects samples that help the batch be self-consistent
-        4. No stale validation data problem
+        1. GROUP-LEVEL SELECTION: In GRPO, each prompt produces num_generations
+           responses that form a contrastive group (good vs bad). Removing individual
+           samples from a group destroys this signal. Instead, we compute a group-level
+           influence score (sum of per-sample IPs within each prompt group) and
+           select/reject entire groups. This preserves GRPO's contrastive learning.
+           
+        2. MATCHING VALIDATION LOSS: PPO step_part_I uses the SAME token-level loss
+           with the SAME advantages for validation as for training. We now do the same:
+           validation_loss = -mean(advantages_expanded * logprobs * masks)
+           using the SAME group-level advantages as training (not batch-level).
         
-        This method:
-        1. Captures training gradients via hooks during forward+backward with ghost_mode
-        2. Saves training gradient buffers
-        3. Computes validation loss using SAME BATCH data
-        4. Captures validation gradients via hooks
-        5. Computes influence scores using efficient matrix operations
-        6. Selects samples with positive influence
-        7. Trains only on selected samples
-        
-        Args:
-            queries: List of query tensors
-            responses: List of response tensors
-            scores: List of reward scores
-            val_*: NOT USED - kept for API compatibility, ignored
-            gen_data_dir: Directory to save generated data
-            
-        Returns:
-            stats: Dictionary of training statistics
-            ghost_ip: List of influence scores per sample
+        Workflow:
+        1. Forward pass, compute logprobs, advantages
+        2. Ghost backward → capture per-sample training gradients
+        3. Fresh forward pass → validation loss (same formulation as training) → 
+           capture validation gradients
+        4. Compute per-sample influence scores
+        5. Aggregate to GROUP-level influence (sum per prompt group)
+        6. Select entire groups with positive influence
+        7. Train on selected groups (all responses preserved per group)
         """
         timing = {}
         t0 = time.time()
         
         bs = len(queries)
+        num_gen = self.config.num_generations
+        num_groups = bs // num_gen
         
         # =====================
         # Part I: Prepare inputs and compute forward pass
         # =====================
-        
-        # Prepare model inputs
         t = time.time()
         model_inputs = self.prepare_model_inputs(queries, responses)
         model_inputs_names = list(model_inputs.keys())
         timing["time/grpo/prepare_inputs"] = time.time() - t
         
-        # Put model in eval mode for gradient computation (disable dropout)
+        # Disable dropout for gradient computation
         self.model.eval()
         for module in self.model.modules():
             if isinstance(module, torch.nn.Dropout):
                 module.eval()
         
-        # Clear ghost buffers before starting
         self._clear_ghost_buffers()
         
-        # Forward pass with ghost recording enabled (captures activations for training)
+        # Forward pass (no_grad because compute_logprobs uses no_grad in eval mode)
         t = time.time()
-        self._record_ghost = True
         logprobs, masks = self.compute_logprobs(self.model, queries, responses, model_inputs)
-        self._record_ghost = False
         
-        # Get reference log probs
+        # Reference logprobs
         with torch.no_grad():
             if self.is_peft_model and hasattr(
                 self.accelerator.unwrap_model(self.model), "disable_adapter"
@@ -1193,29 +1183,19 @@ class GRPOTrainer:
                 ref_logprobs, _ = self.compute_logprobs(self.ref_model, queries, responses, model_inputs)
             else:
                 ref_logprobs = logprobs.detach().clone()
-        
         timing["time/grpo/forward_pass"] = time.time() - t
         
-        # Convert scores to tensor
+        # Scores, rewards, advantages
         scores_tensor = torch.tensor(scores, device=self.current_device, dtype=torch.float32)
         
-        # Compute rewards with KL penalty
         t = time.time()
         rewards, non_score_reward = self.compute_rewards_with_kl(scores_tensor, logprobs.detach(), ref_logprobs, masks)
         timing["time/grpo/compute_rewards"] = time.time() - t
         
-        # Compute group-relative advantages (GRPO training objective)
         t = time.time()
-        advantages = self.compute_group_advantages(scores_tensor, self.config.num_generations)
+        advantages = self.compute_group_advantages(scores_tensor, num_gen)
         advantages_expanded = advantages.unsqueeze(-1).expand_as(logprobs)
         timing["time/grpo/compute_advantages"] = time.time() - t
-
-        # TracIn validation signal should use BATCH-level advantages (not per-group)
-        # This avoids within-group mean-zero cancellation and provides a stronger signal.
-        val_advantages_batch = self.compute_group_advantages(scores_tensor, 1)
-        if torch.isnan(val_advantages_batch).any():
-            print("WARNING: val_advantages_batch contains NaN! Replacing with 0.")
-            val_advantages_batch = torch.nan_to_num(val_advantages_batch, nan=0.0)
         
         # Prepare batch dict
         batch_dict = {
@@ -1227,21 +1207,17 @@ class GRPOTrainer:
             "advantages_expanded": advantages_expanded,
         }
         batch_dict.update(model_inputs)
-        
-        # Store response lengths for consistent indexing
         max_response_len = logprobs.shape[1]
         
         # =====================
-        # Part II: Capture TRAINING gradients via hooks (PPO-style)
+        # Part II: Capture TRAINING gradients via hooks (ghost mode)
         # =====================
         t = time.time()
         log_gpu_memory("Before training gradient capture", verbose=True)
         
-        # Clear ghost buffers and start recording
         self._clear_ghost_buffers()
         self._record_ghost = True
         
-        # Process training samples in batches with ghost_mode (no weight updates)
         for tracin_batch_start in range(0, bs, self.config.tracin_batch_size):
             tracin_batch_end = min(tracin_batch_start + self.config.tracin_batch_size, bs)
             tracin_batch_inds = np.arange(tracin_batch_start, tracin_batch_end)
@@ -1259,26 +1235,23 @@ class GRPOTrainer:
             
             mb_model_inputs = {k: tracin_batch_dict[k] for k in model_inputs_names}
             
-            # Forward pass (hooks capture activations)
+            # Forward pass (hooks capture activations X, H)
             outputs = self.model(
                 input_ids=mb_model_inputs["input_ids"],
                 attention_mask=mb_model_inputs["attention_mask"],
             )
             logits = outputs.logits
             
-            # Compute new log probs
             mb_logprobs_new = self._compute_logprobs_consistent(
                 logits, tracin_batch_dict["queries"], tracin_batch_dict["responses"],
                 mb_model_inputs, max_response_len
             )
-            
-            # Extract response logits for entropy
             response_logits = self._extract_response_logits_consistent(
                 logits, tracin_batch_dict["queries"], tracin_batch_dict["responses"],
                 max_response_len
             )
             
-            # Compute loss for the batch
+            # GRPO loss (same formulation as training)
             pg_loss, _ = self.loss(
                 tracin_batch_dict["logprobs"].detach(),
                 response_logits,
@@ -1287,35 +1260,37 @@ class GRPOTrainer:
                 tracin_batch_dict["advantages_expanded"].detach(),
             )
             
-            # Backward with ghost_mode (captures gradients via hooks but doesn't update weights)
+            # Ghost backward (captures gradients gA, gB via hooks, no weight update)
             with ghost_mode(self.optimizer):
                 self.accelerator.backward(pg_loss, retain_graph=False)
                 self.optimizer.zero_grad()
         
         self._record_ghost = False
-        
-        # Save training gradient buffers
         self._save_train_buffers()
         
         timing["time/grpo/train_gradient_capture"] = time.time() - t
         log_gpu_memory("After training gradient capture", verbose=True)
         
         # =====================
-        # Part III: Capture VALIDATION gradients using SAME BATCH (like PPO step_part_I)
+        # Part III: Capture VALIDATION gradients (same batch, same loss formulation)
         # =====================
-        # KEY INSIGHT: Use the TRAINING BATCH as validation!
-        # We need a FRESH forward pass because training backward consumed the graph.
+        # KEY FIX: Validation loss uses the SAME formulation as training loss,
+        # with the SAME group-level advantages. This matches PPO step_part_I exactly:
+        #   PPO: validation_loss = -mean(advantages * logprobs * masks)
+        #   GRPO: validation_loss = -mean(advantages_expanded * logprobs * masks)
         t = time.time()
         
-        # Clear gradient buffers (keep activations from training in _train_* buffers)
-        for buf in (self._xs, self._hs, self._gAs, self._gBs):
+        # Clear ONLY gradient buffers (like PPO line 1222-1223)
+        for buf in (self._gAs, self._gBs):
+            for name in buf:
+                buf[name] = []
+        # Clear activation buffers too (we need fresh ones from the validation forward pass)
+        for buf in (self._xs, self._hs):
             for name in buf:
                 buf[name] = []
         
-        # FRESH forward pass for validation (needed because training backward consumed the graph)
-        print(f"\n=== Validation Loss (Same-Batch TracIn) ===")
-        print(f"Using TRAINING batch as validation (like PPO step_part_I)")
-        print(f"Running fresh forward pass for validation gradient...")
+        # Fresh forward pass for validation gradient
+        print(f"\n=== Validation Loss (Same-Batch, Group-Level TracIn) ===")
         
         self._record_ghost = True
         val_outputs = self.model(
@@ -1325,100 +1300,57 @@ class GRPOTrainer:
         val_logits = val_outputs.logits
         self._record_ghost = False
         
-        # Compute fresh logprobs from this forward pass
+        # Compute fresh logprobs
         val_logprobs = self._compute_logprobs_consistent(
             val_logits, queries, responses, model_inputs, max_response_len
         )
         
-        print(f"val_logprobs shape: {val_logprobs.shape}, masks shape: {masks.shape}")
-        print(f"advantages (group) shape: {advantages.shape}")
-        print(f"val_advantages_batch shape: {val_advantages_batch.shape}")
+        # VALIDATION LOSS: Match training loss formulation exactly (like PPO step_part_I)
+        # PPO uses: validation_loss = -mean(advantages * all_logprobs * masks)
+        # We use the SAME group-level advantages as training (NOT batch-level!)
+        validation_loss = -torch.mean(
+            advantages_expanded.detach() * val_logprobs.to(torch.float32) * masks.detach()
+        )
         
-        # Use seqloss-lastadv style loss on training batch (like PPO line 1210-1216)
-        if self.config.val_loss_type in ['seqloss-lastadv', 'seqloss-reward']:
-            seq_logprob = (val_logprobs.to(torch.float32) * masks.detach()).sum(dim=1)
-            # Use batch-level advantages for TracIn validation signal
-            seq_score = val_advantages_batch.detach()
-            per_seq_loss = -seq_logprob * seq_score
-            validation_loss = per_seq_loss.mean()
-            print(f'Validation loss (same-batch seqloss): {validation_loss.item():.4f}')
-            print(f'  seq_logprob range: [{seq_logprob.min():.4f}, {seq_logprob.max():.4f}]')
-            print(f'  seq_score (val_advantages_batch) range: [{seq_score.min():.4f}, {seq_score.max():.4f}]')
-            print(f'  val_advantages_batch mean: {val_advantages_batch.mean():.4f}, std: {val_advantages_batch.std():.4f}')
-            
-        elif self.config.val_loss_type == 'rough-orig':
-            # Simple average loss (like PPO line 1206-1208)
-            val_adv_expanded = val_advantages_batch.unsqueeze(-1).detach()
-            validation_loss = -torch.mean(val_adv_expanded * val_logprobs.to(torch.float32) * masks.detach())
-            print(f'Validation loss (rough-orig): {validation_loss.item():.4f}')
-            
-        elif self.config.val_loss_type == 'sample-level-orig':
-            val_adv_expanded = val_advantages_batch.unsqueeze(-1).detach()
-            masked_term = val_adv_expanded * val_logprobs.to(torch.float32) * masks.detach()
-            per_sample_num = masks.sum(dim=1).clamp(min=1)
-            per_sample_sum = masked_term.sum(dim=1)
-            per_sample_loss = -per_sample_sum / per_sample_num
-            validation_loss = per_sample_loss.mean()
-            print(f'Validation loss (sample-level-orig): {validation_loss.item():.4f}')
-            
-        else:
-            # Default: use rough-orig
-            val_adv_expanded = val_advantages_batch.unsqueeze(-1).detach()
-            validation_loss = -torch.mean(val_adv_expanded * val_logprobs.to(torch.float32) * masks.detach())
-            print(f'Validation loss (default rough-orig): {validation_loss.item():.4f}')
+        print(f'Validation loss (rough-orig, group advantages): {validation_loss.item():.4f}')
+        print(f'  advantages mean: {advantages.mean():.4f}, std: {advantages.std():.4f}')
+        print(f'  val_logprobs range: [{val_logprobs.min():.4f}, {val_logprobs.max():.4f}]')
         
         # Check for NaN
         if torch.isnan(validation_loss) or torch.isinf(validation_loss):
-            print(f"ERROR: Validation loss is NaN/Inf! Using fallback loss.")
+            print(f"ERROR: Validation loss is NaN/Inf! Using fallback.")
             validation_loss = -torch.mean(val_logprobs.to(torch.float32) * masks.detach())
         
         print(f"Validation loss final: {validation_loss.item():.4f}")
         print(f"================================\n")
         
-        # Backward on validation loss (captures validation gradients via hooks)
+        # Validation backward (captures validation gradients via hooks)
         self._record_ghost = True
         self.accelerator.backward(validation_loss)
         self._record_ghost = False
         self.optimizer.zero_grad()
         
-        # DEBUG: Check validation gradient norms
-        if len(self._gAs) > 0:
-            val_grad_norms = []
-            for name in list(self._gAs.keys())[:3]:
-                if len(self._gAs[name]) > 0:
-                    gA_norm = torch.cat(self._gAs[name], dim=0).float().norm().item()
-                    val_grad_norms.append(gA_norm)
-            if val_grad_norms:
-                print(f'Validation gradient norms (first 3 layers): {val_grad_norms}')
-        
-        # Free validation tensors
         del validation_loss, val_logprobs, val_outputs, val_logits
         
         timing["time/grpo/validation_gradient"] = time.time() - t
         log_gpu_memory("After validation gradient capture", verbose=True)
         
         # =====================
-        # Part IV: Compute influence scores using efficient matrix operations
+        # Part IV: Compute per-sample influence scores
         # =====================
         t = time.time()
-        
-        # Compute ghost inner products using matrix operations (like PPO)
         ghost_ip = self.compute_ghost_inner_product_matrix_op()
         
-        print(f"Ghost gradient inner products: {ghost_ip[:10]}...")
-        if len(ghost_ip) > 0:
-            valid_ips = [ip for ip in ghost_ip if not (math.isnan(ip) or math.isinf(ip))]
-            if valid_ips:
-                print(f"IP stats (valid): mean={np.mean(valid_ips):.6f}, std={np.std(valid_ips):.6f}, min={np.min(valid_ips):.6f}, max={np.max(valid_ips):.6f}")
-            else:
-                print("WARNING: All IPs are NaN/Inf!")
-        
-        # Check for NaN and replace with 0
+        # Clean NaN/Inf
         ghost_ip = [0.0 if (math.isnan(ip) or math.isinf(ip)) else ip for ip in ghost_ip]
+        ghost_ip_array = np.array(ghost_ip)
+        
+        print(f"Per-sample IPs (first 10): {ghost_ip[:10]}")
+        print(f"IP stats: mean={np.mean(ghost_ip_array):.6f}, std={np.std(ghost_ip_array):.6f}")
         
         timing["time/grpo/tracin_calculation"] = time.time() - t
         
-        # Clear ghost buffers to free memory
+        # Clear ghost buffers
         self._clear_ghost_buffers()
         for buf in (self._train_xs, self._train_hs, self._train_gAs, self._train_gBs):
             for name in list(buf.keys()):
@@ -1427,33 +1359,44 @@ class GRPOTrainer:
         import gc
         gc.collect()
         torch.cuda.empty_cache()
-        
         log_gpu_memory("After TracIn calculation (buffers cleared)", verbose=True)
         
         # =====================
-        # Part V: Select samples with positive influence and train
+        # Part V: GROUP-LEVEL selection (THE KEY FIX!)
         # =====================
+        # In GRPO, each prompt has num_generations responses forming a contrastive group.
+        # PPO has 1 response/prompt so per-sample = per-group. For GRPO, we MUST
+        # select/reject ENTIRE groups to preserve the contrastive signal.
+        #
+        # Group influence = sum of per-sample IPs within the group.
+        # If group IP > 0: the group's gradient aligns with the overall direction → keep.
+        # If group IP < 0: the group conflicts → remove.
         t = time.time()
         
-        # Analyze influence score distribution
-        ghost_ip_array = np.array(ghost_ip)
-        positive_count = np.sum(ghost_ip_array > 0)
-        negative_count = np.sum(ghost_ip_array < 0)
-        zero_count = np.sum(ghost_ip_array == 0)
+        group_ips = []
+        for g in range(num_groups):
+            start = g * num_gen
+            end = (g + 1) * num_gen
+            group_ip = np.sum(ghost_ip_array[start:end])
+            group_ips.append(group_ip)
+        group_ips = np.array(group_ips)
         
-        print(f'Influence score distribution:')
-        print(f'  Positive: {positive_count} ({100*positive_count/bs:.1f}%)')
-        print(f'  Negative: {negative_count} ({100*negative_count/bs:.1f}%)')
-        print(f'  Zero: {zero_count} ({100*zero_count/bs:.1f}%)')
-        print(f'  Mean: {np.mean(ghost_ip_array):.6f}, Std: {np.std(ghost_ip_array):.6f}')
-        print(f'  Min: {np.min(ghost_ip_array):.6f}, Max: {np.max(ghost_ip_array):.6f}')
+        # Select groups with positive influence
+        selected_groups = np.where(group_ips > 0)[0]
+        selected_ids = []
+        for g in selected_groups:
+            for i in range(g * num_gen, (g + 1) * num_gen):
+                selected_ids.append(i)
+        selected_ids = np.array(selected_ids) if len(selected_ids) > 0 else np.array([], dtype=int)
         
-        # PPO-STYLE SAMPLE SELECTION: Select samples with positive influence
-        # This matches PPO TracIn exactly
-        selected_ids = np.where(ghost_ip_array > 0)[0]
-        print(f'Number of selected samples (positive influence): {len(selected_ids)} / {bs}')
+        print(f'\n=== Group-Level TracIn Selection ===')
+        print(f'  Num groups: {num_groups} (each with {num_gen} responses)')
+        print(f'  Group IPs: {group_ips}')
+        print(f'  Selected groups: {len(selected_groups)} / {num_groups} ({100*len(selected_groups)/max(num_groups,1):.0f}%)')
+        print(f'  Selected samples: {len(selected_ids)} / {bs} ({100*len(selected_ids)/max(bs,1):.0f}%)')
+        print(f'  Group IP stats: mean={np.mean(group_ips):.6f}, min={np.min(group_ips):.6f}, max={np.max(group_ips):.6f}')
         
-        # Save generated data if requested
+        # Save generated data
         if gen_data_dir is not None:
             os.makedirs(gen_data_dir, exist_ok=True)
             torch.save({
@@ -1467,28 +1410,28 @@ class GRPOTrainer:
                 "masks": masks.cpu(),
                 "kl_ctl_value": self.kl_ctl.value,
                 "ghost_ip": ghost_ip,
+                "group_ips": group_ips.tolist(),
+                "selected_groups": selected_groups.tolist(),
                 "selected_ids": selected_ids.tolist(),
             }, f'{gen_data_dir}/grpo_tracin_samples_seed-{self.config.seed}_{self.save_cnt}.pt')
             print(f'File saved to {gen_data_dir}/grpo_tracin_samples_seed-{self.config.seed}_{self.save_cnt}.pt')
             self.save_cnt += 1
         
-        # PPO-STYLE TRAINING: Train ONLY on selected samples
-        # This matches PPO TracIn exactly
+        # =====================
+        # Part VI: Train on selected groups (contrastive structure preserved!)
+        # =====================
         if len(selected_ids) > 0:
             sel_bs = len(selected_ids)
             all_stats = []
             self.model.train()
             
-            print(f"Training on {sel_bs} selected samples (positive influence)")
+            print(f"Training on {sel_bs} samples from {len(selected_groups)} selected groups")
             
             for epoch in range(self.config.grpo_epochs):
-                # Shuffle selected indices
                 b_inds = np.random.permutation(selected_ids)
                 
                 for backward_batch_start in range(0, sel_bs, self.config.backward_batch_size):
                     backward_batch_end = backward_batch_start + self.config.backward_batch_size
-                    
-                    # PPO-style: drop last batch if smaller than batch size
                     if backward_batch_end > sel_bs:
                         break
                     
@@ -1501,7 +1444,6 @@ class GRPOTrainer:
                         if len(mini_batch_inds) == 0:
                             continue
                         
-                        # Get mini-batch data
                         mb_logprobs_old = batch_dict["logprobs"][mini_batch_inds].detach()
                         mb_advantages = batch_dict["advantages_expanded"][mini_batch_inds].detach()
                         mb_masks = batch_dict["masks"][mini_batch_inds]
@@ -1513,7 +1455,6 @@ class GRPOTrainer:
                             "attention_mask": batch_dict["attention_mask"][mini_batch_inds],
                         }
                         
-                        # Forward pass
                         with self.accelerator.accumulate(self.model):
                             outputs = self.model(
                                 input_ids=mb_model_inputs["input_ids"],
@@ -1521,17 +1462,13 @@ class GRPOTrainer:
                             )
                             logits = outputs.logits
                             
-                            # Compute new log probs
                             mb_logprobs_new = self._compute_logprobs_consistent(
                                 logits, mb_queries, mb_responses, mb_model_inputs, max_response_len
                             )
-                            
-                            # Extract response logits
                             response_logits = self._extract_response_logits_consistent(
                                 logits, mb_queries, mb_responses, max_response_len
                             )
                             
-                            # Compute loss
                             pg_loss, stats = self.loss(
                                 mb_logprobs_old,
                                 response_logits,
@@ -1540,7 +1477,6 @@ class GRPOTrainer:
                                 mb_advantages,
                             )
                             
-                            # Backward pass
                             self.accelerator.backward(pg_loss)
                             
                             if self.config.max_grad_norm is not None:
@@ -1552,30 +1488,25 @@ class GRPOTrainer:
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             
-                            # Convert stats tensors to CPU/scalars before storing
                             stats_cpu = {k: v.detach().cpu().item() if isinstance(v, torch.Tensor) else v for k, v in stats.items()}
                             all_stats.append(stats_cpu)
                             
-                            # FREE mini-batch tensors immediately
                             del outputs, logits, mb_logprobs_new, response_logits, pg_loss
                             del mb_logprobs_old, mb_advantages, mb_masks, mb_model_inputs
             
             timing["time/grpo/optimization"] = time.time() - t
-            
-            # Memory cleanup after training loop
             gc.collect()
             torch.cuda.empty_cache()
             log_gpu_memory("After training loop", verbose=True)
         else:
-            print("Warning: No samples with positive influence. Skipping training step.")
+            print("Warning: No groups with positive influence. Skipping training step.")
             all_stats = [{"loss/policy": 0.0, "loss/total": 0.0}]
             timing["time/grpo/optimization"] = time.time() - t
         
-        # Aggregate stats (with safety check for empty list)
-        # All stats are now scalars (converted to CPU in training loop)
+        # Aggregate stats
         stats = {}
         if len(all_stats) == 0:
-            print("WARNING: No training stats collected (training loop didn't execute). Using defaults.")
+            print("WARNING: No training stats collected. Using defaults.")
             stats = {"loss/policy": 0.0, "loss/total": 0.0}
         else:
             print(f"Aggregating stats from {len(all_stats)} training steps")
@@ -1597,91 +1528,43 @@ class GRPOTrainer:
             scores=scores_tensor,
             rewards=rewards,
         ))
+        stats["tracin/num_selected_groups"] = len(selected_groups)
+        stats["tracin/num_total_groups"] = num_groups
+        stats["tracin/group_selection_ratio"] = len(selected_groups) / max(num_groups, 1)
         stats["tracin/num_selected"] = len(selected_ids)
         stats["tracin/selection_ratio"] = len(selected_ids) / bs
         stats["tracin/mean_ip"] = np.mean(ghost_ip)
         stats["tracin/std_ip"] = np.std(ghost_ip)
         stats["tracin/min_ip"] = np.min(ghost_ip)
         stats["tracin/max_ip"] = np.max(ghost_ip)
-        stats["tracin/positive_ratio"] = np.sum(np.array(ghost_ip) > 0) / bs
-        stats["tracin/negative_ratio"] = np.sum(np.array(ghost_ip) < 0) / bs
+        stats["tracin/mean_group_ip"] = np.mean(group_ips)
+        stats["tracin/positive_ratio"] = np.sum(ghost_ip_array > 0) / bs
+        stats["tracin/negative_ratio"] = np.sum(ghost_ip_array < 0) / bs
         stats.update(timing)
         stats["time/grpo/total"] = time.time() - t0
         
-        # =====================
-        # Final memory cleanup (SAFE - explicit try/except blocks)
-        # =====================
-        # Save return values first (before deleting ghost_ip)
+        # Save return values before cleanup
         ghost_ip_copy = list(ghost_ip)
         
-        # Delete batch_dict GPU tensors safely
-        try:
-            if isinstance(batch_dict, dict):
-                for k in list(batch_dict.keys()):
-                    if isinstance(batch_dict[k], torch.Tensor) and batch_dict[k].is_cuda:
-                        del batch_dict[k]
-                del batch_dict
-        except (NameError, AttributeError, KeyError):
-            pass
+        # Memory cleanup
+        for var_name in ['batch_dict', 'logprobs', 'ref_logprobs', 'masks', 'rewards',
+                         'advantages', 'advantages_expanded', 'scores_tensor',
+                         'model_inputs', 'selected_ids', 'ghost_ip', 'all_stats',
+                         'ghost_ip_array', 'group_ips', 'selected_groups']:
+            try:
+                obj = locals().get(var_name)
+                if obj is not None:
+                    if isinstance(obj, dict):
+                        for k in list(obj.keys()):
+                            if isinstance(obj[k], torch.Tensor) and obj[k].is_cuda:
+                                del obj[k]
+                    del obj
+            except:
+                pass
         
-        # Delete GPU tensors explicitly (safe - wrapped in try/except)
-        # These variables are defined in the function, so we can safely try to delete them
-        try:
-            del logprobs
-        except NameError:
-            pass
-        try:
-            del ref_logprobs
-        except NameError:
-            pass
-        try:
-            del masks
-        except NameError:
-            pass
-        try:
-            del rewards
-        except NameError:
-            pass
-        try:
-            del advantages
-        except NameError:
-            pass
-        try:
-            del advantages_expanded
-        except NameError:
-            pass
-        try:
-            del scores_tensor
-        except NameError:
-            pass
-        try:
-            del model_inputs
-        except NameError:
-            pass
-        try:
-            del trainable_params
-        except NameError:
-            pass
-        try:
-            del selected_ids
-        except NameError:
-            pass
-        try:
-            del ghost_ip
-        except NameError:
-            pass
-        try:
-            del all_stats
-        except NameError:
-            pass
-        
-        # Force Python garbage collection
         gc.collect()
         gc.collect()
-        
-        # Empty CUDA cache
         torch.cuda.empty_cache()
-        
         log_gpu_memory("End of step_tracin (after cleanup)", verbose=True)
         
         return stats, ghost_ip_copy
