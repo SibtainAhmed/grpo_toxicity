@@ -1334,38 +1334,17 @@ class GRPOTrainer:
         print(f"advantages (group) shape: {advantages.shape}")
         print(f"val_advantages_batch shape: {val_advantages_batch.shape}")
         
-        # Use seqloss-lastadv style loss on training batch (like PPO line 1210-1216)
-        if self.config.val_loss_type in ['seqloss-lastadv', 'seqloss-reward']:
-            seq_logprob = (val_logprobs.to(torch.float32) * masks.detach()).sum(dim=1)
-            # Use batch-level advantages for TracIn validation signal
-            seq_score = val_advantages_batch.detach()
-            per_seq_loss = -seq_logprob * seq_score
-            validation_loss = per_seq_loss.mean()
-            print(f'Validation loss (same-batch seqloss): {validation_loss.item():.4f}')
-            print(f'  seq_logprob range: [{seq_logprob.min():.4f}, {seq_logprob.max():.4f}]')
-            print(f'  seq_score (val_advantages_batch) range: [{seq_score.min():.4f}, {seq_score.max():.4f}]')
-            print(f'  val_advantages_batch mean: {val_advantages_batch.mean():.4f}, std: {val_advantages_batch.std():.4f}')
-            
-        elif self.config.val_loss_type == 'rough-orig':
-            # Simple average loss (like PPO line 1206-1208)
-            val_adv_expanded = val_advantages_batch.unsqueeze(-1).detach()
-            validation_loss = -torch.mean(val_adv_expanded * val_logprobs.to(torch.float32) * masks.detach())
-            print(f'Validation loss (rough-orig): {validation_loss.item():.4f}')
-            
-        elif self.config.val_loss_type == 'sample-level-orig':
-            val_adv_expanded = val_advantages_batch.unsqueeze(-1).detach()
-            masked_term = val_adv_expanded * val_logprobs.to(torch.float32) * masks.detach()
-            per_sample_num = masks.sum(dim=1).clamp(min=1)
-            per_sample_sum = masked_term.sum(dim=1)
-            per_sample_loss = -per_sample_sum / per_sample_num
-            validation_loss = per_sample_loss.mean()
-            print(f'Validation loss (sample-level-orig): {validation_loss.item():.4f}')
-            
-        else:
-            # Default: use rough-orig
-            val_adv_expanded = val_advantages_batch.unsqueeze(-1).detach()
-            validation_loss = -torch.mean(val_adv_expanded * val_logprobs.to(torch.float32) * masks.detach())
-            print(f'Validation loss (default rough-orig): {validation_loss.item():.4f}')
+        # Same-batch TracIn works best with TOKEN-LEVEL validation loss (PPO rough-orig style).
+        # Sequence-level losses are too weak/noisy for GRPO and cause unstable influence scores.
+        val_adv_expanded = val_advantages_batch.unsqueeze(-1).detach()
+        masked_term = val_adv_expanded * val_logprobs.to(torch.float32) * masks.detach()
+        per_sample_num = masks.sum(dim=1).clamp(min=1)
+        per_sample_sum = masked_term.sum(dim=1)
+        per_sample_loss = -per_sample_sum / per_sample_num
+        validation_loss = per_sample_loss.mean()
+        print(f'Validation loss (same-batch token-level): {validation_loss.item():.4f}')
+        print(f'  per_sample_loss range: [{per_sample_loss.min():.4f}, {per_sample_loss.max():.4f}]')
+        print(f'  val_advantages_batch mean: {val_advantages_batch.mean():.4f}, std: {val_advantages_batch.std():.4f}')
         
         # Check for NaN
         if torch.isnan(validation_loss) or torch.isinf(validation_loss):
@@ -1449,9 +1428,17 @@ class GRPOTrainer:
         print(f'  Min: {np.min(ghost_ip_array):.6f}, Max: {np.max(ghost_ip_array):.6f}')
         
         # PPO-STYLE SAMPLE SELECTION: Select samples with positive influence
-        # This matches PPO TracIn exactly
         selected_ids = np.where(ghost_ip_array > 0)[0]
         print(f'Number of selected samples (positive influence): {len(selected_ids)} / {bs}')
+
+        # Fallback: if too few positives, select top-K by influence magnitude
+        # This prevents training from stalling when influence signal is weak/noisy.
+        min_keep = max(1, int(0.25 * bs))
+        if len(selected_ids) < min_keep:
+            top_k = min_keep
+            top_k_ids = np.argsort(ghost_ip_array)[-top_k:]
+            selected_ids = top_k_ids
+            print(f'Fallback: selected top-{top_k} samples by influence (positive too few).')
         
         # Save generated data if requested
         if gen_data_dir is not None:
