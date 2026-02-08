@@ -1436,6 +1436,8 @@ class GRPOTrainer:
         
         # =====================
         # Part VI: Train on selected groups (contrastive structure preserved!)
+        # Match step() training loop EXACTLY — no nested backward_batch loop,
+        # no accelerator.accumulate(), direct mini-batch iteration.
         # =====================
         if len(selected_ids) > 0:
             sel_bs = len(selected_ids)
@@ -1445,78 +1447,74 @@ class GRPOTrainer:
             print(f"Training on {sel_bs} samples from {len(selected_groups)} selected groups")
             
             for epoch in range(self.config.grpo_epochs):
-                b_inds = np.random.permutation(selected_ids)
+                # Shuffle selected indices (matches step()'s torch.randperm approach)
+                perm = torch.randperm(sel_bs)
+                shuffled_ids = selected_ids[perm.numpy()]
                 
-                for backward_batch_start in range(0, sel_bs, self.config.backward_batch_size):
-                    backward_batch_end = backward_batch_start + self.config.backward_batch_size
-                    if backward_batch_end > sel_bs:
-                        break
+                for start_idx in range(0, sel_bs, self.config.mini_batch_size):
+                    end_idx = min(start_idx + self.config.mini_batch_size, sel_bs)
+                    mini_batch_inds = shuffled_ids[start_idx:end_idx]
                     
-                    backward_batch_inds = b_inds[backward_batch_start:backward_batch_end]
+                    if len(mini_batch_inds) == 0:
+                        continue
                     
-                    for mini_batch_start in range(0, self.config.backward_batch_size, self.config.mini_batch_size):
-                        mini_batch_end = mini_batch_start + self.config.mini_batch_size
-                        mini_batch_inds = backward_batch_inds[mini_batch_start:mini_batch_end]
-                        
-                        if len(mini_batch_inds) == 0:
-                            continue
-                        
-                        mb_logprobs_old = batch_dict["logprobs"][mini_batch_inds].detach()
-                        mb_advantages = batch_dict["advantages_expanded"][mini_batch_inds].detach()
-                        mb_masks = batch_dict["masks"][mini_batch_inds]
-                        mb_queries = [batch_dict["queries"][i] for i in mini_batch_inds]
-                        mb_responses = [batch_dict["responses"][i] for i in mini_batch_inds]
-                        
-                        mb_model_inputs = {
-                            "input_ids": batch_dict["input_ids"][mini_batch_inds],
-                            "attention_mask": batch_dict["attention_mask"][mini_batch_inds],
-                        }
-                        
-                        with self.accelerator.accumulate(self.model):
-                            outputs = self.model(
-                                input_ids=mb_model_inputs["input_ids"],
-                                attention_mask=mb_model_inputs["attention_mask"],
-                            )
-                            logits = outputs.logits
-                            
-                            mb_logprobs_new = self._compute_logprobs_consistent(
-                                logits, mb_queries, mb_responses, mb_model_inputs, max_response_len
-                            )
-                            response_logits = self._extract_response_logits_consistent(
-                                logits, mb_queries, mb_responses, max_response_len
-                            )
-                            
-                            pg_loss, stats = self.loss(
-                                mb_logprobs_old,
-                                response_logits,
-                                mb_logprobs_new,
-                                mb_masks,
-                                mb_advantages,
-                            )
-                            
-                            self.accelerator.backward(pg_loss)
-                            
-                            if self.config.max_grad_norm is not None:
-                                torch.nn.utils.clip_grad_norm_(
-                                    self.model.parameters(),
-                                    self.config.max_grad_norm
-                                )
-                            
-                            self.optimizer.step()
-                            self.optimizer.zero_grad()
-                            
-                            stats_cpu = {k: v.detach().cpu().item() if isinstance(v, torch.Tensor) else v for k, v in stats.items()}
-                            all_stats.append(stats_cpu)
-                            
-                            del outputs, logits, mb_logprobs_new, response_logits, pg_loss
-                            del mb_logprobs_old, mb_advantages, mb_masks, mb_model_inputs
+                    mb_logprobs_old = batch_dict["logprobs"][mini_batch_inds].detach()
+                    mb_advantages = batch_dict["advantages_expanded"][mini_batch_inds].detach()
+                    mb_masks = batch_dict["masks"][mini_batch_inds]
+                    mb_queries = [batch_dict["queries"][i] for i in mini_batch_inds]
+                    mb_responses = [batch_dict["responses"][i] for i in mini_batch_inds]
+                    
+                    mb_model_inputs = {
+                        "input_ids": batch_dict["input_ids"][mini_batch_inds],
+                        "attention_mask": batch_dict["attention_mask"][mini_batch_inds],
+                    }
+                    
+                    # Forward pass (no accumulate — same as step())
+                    outputs = self.model(
+                        input_ids=mb_model_inputs["input_ids"],
+                        attention_mask=mb_model_inputs["attention_mask"],
+                    )
+                    logits = outputs.logits
+                    
+                    mb_logprobs_new = self._compute_logprobs_consistent(
+                        logits, mb_queries, mb_responses, mb_model_inputs, max_response_len
+                    )
+                    response_logits = self._extract_response_logits_consistent(
+                        logits, mb_queries, mb_responses, max_response_len
+                    )
+                    
+                    pg_loss, stats = self.loss(
+                        mb_logprobs_old,
+                        response_logits,
+                        mb_logprobs_new,
+                        mb_masks,
+                        mb_advantages,
+                    )
+                    
+                    # Backward + step (same as step() — no accumulation wrapper)
+                    self.accelerator.backward(pg_loss)
+                    
+                    if self.config.max_grad_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.config.max_grad_norm
+                        )
+                    
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    
+                    stats_cpu = {k: v.detach().cpu().item() if isinstance(v, torch.Tensor) else v for k, v in stats.items()}
+                    all_stats.append(stats_cpu)
+                    
+                    del outputs, logits, mb_logprobs_new, response_logits, pg_loss
+                    del mb_logprobs_old, mb_advantages, mb_masks, mb_model_inputs
             
             timing["time/grpo/optimization"] = time.time() - t
             gc.collect()
             torch.cuda.empty_cache()
             log_gpu_memory("After training loop", verbose=True)
         else:
-            print("Warning: No groups with positive influence. Skipping training step.")
+            print("Warning: No groups selected. Skipping training step.")
             all_stats = [{"loss/policy": 0.0, "loss/total": 0.0}]
             timing["time/grpo/optimization"] = time.time() - t
         
