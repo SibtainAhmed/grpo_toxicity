@@ -1381,8 +1381,24 @@ class GRPOTrainer:
             group_ips.append(group_ip)
         group_ips = np.array(group_ips)
         
-        # Select groups with positive influence
-        selected_groups = np.where(group_ips > 0)[0]
+        # Select groups: positive influence, with minimum-keep guarantee
+        # With few groups (e.g. 8), purely positive-IP selection can reject ALL groups
+        # on some steps, causing zero training (loss=0). To prevent this:
+        #   1. Keep all groups with positive IP
+        #   2. If that gives fewer than min_keep groups, take the top-K by IP instead
+        min_keep = max(num_groups // 2, 1)  # Always keep at least 50% of groups
+        
+        positive_groups = np.where(group_ips > 0)[0]
+        #new changes
+        if len(positive_groups) >= min_keep: 
+            # Enough positive groups — use them
+            selected_groups = positive_groups
+        else:
+            # Too few positive groups — take the top min_keep by IP
+            # This ensures we always train, using the "least harmful" groups
+            sorted_group_inds = np.argsort(group_ips)[::-1]  # highest IP first
+            selected_groups = sorted_group_inds[:min_keep]
+        
         selected_ids = []
         for g in selected_groups:
             for i in range(g * num_gen, (g + 1) * num_gen):
@@ -1392,6 +1408,7 @@ class GRPOTrainer:
         print(f'\n=== Group-Level TracIn Selection ===')
         print(f'  Num groups: {num_groups} (each with {num_gen} responses)')
         print(f'  Group IPs: {group_ips}')
+        print(f'  Positive groups: {len(positive_groups)}, min_keep: {min_keep}')
         print(f'  Selected groups: {len(selected_groups)} / {num_groups} ({100*len(selected_groups)/max(num_groups,1):.0f}%)')
         print(f'  Selected samples: {len(selected_ids)} / {bs} ({100*len(selected_ids)/max(bs,1):.0f}%)')
         print(f'  Group IP stats: mean={np.mean(group_ips):.6f}, min={np.min(group_ips):.6f}, max={np.max(group_ips):.6f}')
