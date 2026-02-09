@@ -1,6 +1,6 @@
 #!/bin/bash
 # GRPO Training Script with TracIn (Influence Function) for Toxicity Reduction
-#xyz
+#
 # KEY CHANGES (GROUP-LEVEL TracIn):
 # 1. GROUP-LEVEL SELECTION: In GRPO, each prompt produces num_generations
 #    responses forming a contrastive group (good vs bad). Per-sample selection
@@ -55,4 +55,7 @@ accelerate launch --main_process_port=29525 \
     --tracin \
     --with_validation \
     --val_loss_type="rough-orig" \
+    --eval_freq=50 \
+    --eval_num_samples=256 \
+    --eval_toxicity_model="s-nlp/roberta_toxicity_classifier" \
     --gen_data_dir="gen_tox_grpo_samples_tracin_2.7b_fp16_kl-0.04_samebatch_gen-8_mbs-32_seed-22"

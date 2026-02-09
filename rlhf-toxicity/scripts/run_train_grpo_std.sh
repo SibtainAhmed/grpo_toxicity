@@ -41,4 +41,7 @@ accelerate launch --main_process_port=29523 \
     --temperature=1.0 \
     --wandb_project="grpo-detox" \
     --run_name="grpo-std-2.7b-fp16_kl-0.04_mbs-32_seed-22" \
+    --eval_freq=50 \
+    --eval_num_samples=256 \
+    --eval_toxicity_model="s-nlp/roberta_toxicity_classifier" \
     --gen_data_dir="gen_tox_grpo_samples_std_2.7b_fp16_kl-0.04_mbs-32_seed-22" \

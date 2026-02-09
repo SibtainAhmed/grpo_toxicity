@@ -85,6 +85,11 @@ class GRPOScriptArguments:
     run_name: Optional[str] = field(default="llamatrl", metadata={"help": "wandb run name"})
     gen_data_dir: Optional[str] = field(default=None, metadata={"help": "directory to save generated data"})
     val_strategy: Optional[str] = field(default="random", metadata={"help": "validation strategy"})
+    
+    # Evaluation params (periodic test-set eval with different toxicity detector)
+    eval_freq: Optional[int] = field(default=50, metadata={"help": "evaluate every N steps (0 to disable)"})
+    eval_num_samples: Optional[int] = field(default=256, metadata={"help": "number of test prompts to evaluate on"})
+    eval_toxicity_model: Optional[str] = field(default="s-nlp/roberta_toxicity_classifier", metadata={"help": "different toxicity detector for evaluation"})
 
 
 # ============================================================================
@@ -239,6 +244,185 @@ def get_reward_scores(reward_model, reward_tokenizer, texts, device):
     return scores_list
 
 
+# ============================================================================
+# During-training Evaluation (different test set + different toxicity detector)
+# Mimics the paper's Figure 7: periodic toxicity evaluation on held-out test set
+# ============================================================================
+
+def load_eval_toxicity_model(model_name, device):
+    """
+    Load a DIFFERENT toxicity classifier for evaluation.
+    This is distinct from the training reward model to avoid reward hacking.
+    
+    Training reward model: facebook/roberta-hate-speech-dynabench-r4-target
+    Eval toxicity model: s-nlp/roberta_toxicity_classifier (or configurable)
+    """
+    from transformers import pipeline as hf_pipeline
+    
+    print(f"\n=== Loading Evaluation Toxicity Model ===")
+    print(f"  Model: {model_name}")
+    print(f"  (Different from training reward model!)")
+    
+    eval_classifier = hf_pipeline(
+        "text-classification",
+        model=model_name,
+        device=device if isinstance(device, int) else 0,
+        batch_size=64,
+        truncation=True,
+        max_length=512,
+    )
+    
+    print(f"  Eval toxicity model loaded successfully!")
+    return eval_classifier
+
+
+def evaluate_toxicity_on_test_set(
+    model,
+    tokenizer,
+    test_prompts,
+    eval_classifier,
+    device,
+    num_samples=256,
+    max_new_tokens=20,
+    generation_kwargs=None,
+):
+    """
+    Evaluate the current model's toxicity on a held-out test set using
+    a DIFFERENT toxicity detector than the training reward model.
+    
+    This gives an unbiased measure of whether toxicity is truly decreasing,
+    not just that the model learned to game the specific reward model.
+    
+    Args:
+        model: The current policy model
+        tokenizer: Tokenizer
+        test_prompts: List of test prompt tensors (from held-out split)
+        eval_classifier: Different toxicity classifier pipeline
+        device: CUDA device
+        num_samples: Number of test prompts to evaluate
+        max_new_tokens: Max tokens to generate
+        generation_kwargs: Generation parameters
+        
+    Returns:
+        Dict of eval metrics
+    """
+    import random
+    
+    model.eval()
+    
+    # Sample test prompts
+    num_available = len(test_prompts)
+    num_eval = min(num_samples, num_available)
+    sample_indices = random.sample(range(num_available), num_eval)
+    
+    eval_prompts = [test_prompts[i] for i in sample_indices]
+    
+    if generation_kwargs is None:
+        generation_kwargs = {
+            "min_length": -1,
+            "top_k": 0.0,
+            "top_p": 1.0,
+            "do_sample": True,
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "max_new_tokens": max_new_tokens,
+            "temperature": 1.0,
+        }
+    
+    # Generate responses in batches
+    all_texts = []
+    gen_batch_size = 32
+    
+    with torch.no_grad():
+        for batch_start in range(0, num_eval, gen_batch_size):
+            batch_end = min(batch_start + gen_batch_size, num_eval)
+            batch_prompts = eval_prompts[batch_start:batch_end]
+            
+            # Pad prompts
+            max_prompt_len = max(len(p) for p in batch_prompts)
+            padded_inputs = torch.full(
+                (len(batch_prompts), max_prompt_len),
+                tokenizer.pad_token_id,
+                dtype=torch.long,
+                device=device,
+            )
+            attention_mask = torch.zeros_like(padded_inputs)
+            
+            for i, prompt in enumerate(batch_prompts):
+                prompt_tensor = prompt.to(device) if isinstance(prompt, torch.Tensor) else torch.tensor(prompt, device=device)
+                padded_inputs[i, max_prompt_len - len(prompt_tensor):] = prompt_tensor
+                attention_mask[i, max_prompt_len - len(prompt_tensor):] = 1
+            
+            # Generate
+            outputs = model.generate(
+                input_ids=padded_inputs,
+                attention_mask=attention_mask,
+                **generation_kwargs,
+            )
+            
+            # Decode only the generated part
+            prompt_length = padded_inputs.shape[1]
+            generated_tokens = outputs[:, prompt_length:]
+            
+            # Decode prompt + response for full text
+            prompt_texts = tokenizer.batch_decode(padded_inputs, skip_special_tokens=True)
+            response_texts = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+            
+            for p_text, r_text in zip(prompt_texts, response_texts):
+                all_texts.append(p_text + r_text)
+            
+            del outputs, padded_inputs, attention_mask
+    
+    if len(all_texts) == 0:
+        return {"eval/toxicity_mean": 0.0, "eval/toxicity_std": 0.0, "eval/num_samples": 0}
+    
+    # Score toxicity using the DIFFERENT detector
+    import numpy as np
+    toxicity_scores = []
+    
+    # Process in batches for the classifier
+    for batch_start in range(0, len(all_texts), 64):
+        batch_end = min(batch_start + 64, len(all_texts))
+        batch_texts = all_texts[batch_start:batch_end]
+        
+        results = eval_classifier(batch_texts)
+        
+        for result in results:
+            # Handle different output formats
+            if isinstance(result, list):
+                # Pipeline returns list of dicts per sample
+                # Find the "toxic" or "LABEL_1" score
+                toxic_score = 0.0
+                for label_dict in result:
+                    label = label_dict.get("label", "").lower()
+                    if "toxic" in label or label == "label_1":
+                        toxic_score = label_dict["score"]
+                        break
+                toxicity_scores.append(toxic_score)
+            elif isinstance(result, dict):
+                label = result.get("label", "").lower()
+                score = result["score"]
+                # If label is "toxic", use score directly
+                # If label is "neutral", toxicity = 1 - score
+                if "toxic" in label or label == "label_1":
+                    toxicity_scores.append(score)
+                else:
+                    toxicity_scores.append(1.0 - score)
+    
+    toxicity_array = np.array(toxicity_scores)
+    
+    eval_metrics = {
+        "eval/toxicity_mean": float(np.mean(toxicity_array)),
+        "eval/toxicity_std": float(np.std(toxicity_array)),
+        "eval/toxicity_max": float(np.max(toxicity_array)),
+        "eval/toxicity_min": float(np.min(toxicity_array)),
+        "eval/toxic_frac": float(np.mean(toxicity_array > 0.5)),  # fraction of toxic outputs
+        "eval/num_samples": num_eval,
+    }
+    
+    return eval_metrics
+
+
 def select_random_validation_set(
     val_question_tensors,
     val_questions,
@@ -342,6 +526,8 @@ def grpo_train_loop(
     tokenizer,
     reward_tokenizer,
     min_length=20,
+    eval_classifier=None,
+    test_prompts=None,
 ):
     """
     Standard GRPO training loop without TracIn.
@@ -462,10 +648,48 @@ def grpo_train_loop(
         if epoch % 10 == 0:
             print(f"\n[Step {epoch}] Reward mean: {mean(scores):.4f}, KL coef: {grpo_trainer.kl_ctl.value:.4f}")
         
+        # === Periodic Evaluation on held-out test set with different toxicity detector ===
+        if (eval_classifier is not None and test_prompts is not None 
+                and script_args.eval_freq > 0 and epoch % script_args.eval_freq == 0):
+            print(f"\n[Step {epoch}] Running evaluation on test set...")
+            eval_metrics = evaluate_toxicity_on_test_set(
+                model=grpo_trainer.model,
+                tokenizer=tokenizer,
+                test_prompts=test_prompts,
+                eval_classifier=eval_classifier,
+                device=device,
+                num_samples=script_args.eval_num_samples,
+                max_new_tokens=script_args.max_length - min_length,
+                generation_kwargs=generation_kwargs,
+            )
+            print(f"  Eval toxicity: {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
+            print(f"  Toxic fraction (>0.5): {eval_metrics['eval/toxic_frac']:.4f}")
+            
+            # Log to WandB
+            grpo_trainer.accelerator.log(eval_metrics)
+            grpo_trainer.model.train()  # Restore training mode
+        
         # Save checkpoint
         if script_args.save_freq and epoch % script_args.save_freq == 0:
             save_path = os.path.join(script_args.output_dir, f"step_{epoch}")
             grpo_trainer.save_pretrained(save_path)
+    
+    # Final evaluation
+    if eval_classifier is not None and test_prompts is not None:
+        print(f"\n=== Final Evaluation ===")
+        eval_metrics = evaluate_toxicity_on_test_set(
+            model=grpo_trainer.model,
+            tokenizer=tokenizer,
+            test_prompts=test_prompts,
+            eval_classifier=eval_classifier,
+            device=device,
+            num_samples=script_args.eval_num_samples,
+            max_new_tokens=script_args.max_length - min_length,
+            generation_kwargs=generation_kwargs,
+        )
+        print(f"  Final toxicity: {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
+        print(f"  Final toxic fraction: {eval_metrics['eval/toxic_frac']:.4f}")
+        grpo_trainer.accelerator.log(eval_metrics)
     
     # Save final model
     final_path = os.path.join(script_args.output_dir, "final")
@@ -482,6 +706,8 @@ def grpo_train_loop_with_validation(
     val_question_tensors,
     val_questions,
     min_length=20,
+    eval_classifier=None,
+    test_prompts=None,
 ):
     """
     GRPO training loop with TracIn influence-based sample selection.
@@ -607,6 +833,25 @@ def grpo_train_loop_with_validation(
             print(f"  Mean IP: {stats.get('tracin/mean_ip', 0):.6f}")
             print(f"  KL coef: {grpo_trainer.kl_ctl.value:.4f}")
         
+        # === Periodic Evaluation on held-out test set with different toxicity detector ===
+        if (eval_classifier is not None and test_prompts is not None 
+                and script_args.eval_freq > 0 and epoch % script_args.eval_freq == 0):
+            print(f"\n[Step {epoch}] Running evaluation on test set...")
+            eval_metrics = evaluate_toxicity_on_test_set(
+                model=grpo_trainer.model,
+                tokenizer=tokenizer,
+                test_prompts=test_prompts,
+                eval_classifier=eval_classifier,
+                device=device,
+                num_samples=script_args.eval_num_samples,
+                max_new_tokens=script_args.max_length - min_length,
+                generation_kwargs=generation_kwargs,
+            )
+            print(f"  Eval toxicity: {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
+            print(f"  Toxic fraction (>0.5): {eval_metrics['eval/toxic_frac']:.4f}")
+            grpo_trainer.accelerator.log(eval_metrics)
+            grpo_trainer.model.train()  # Restore training mode
+        
         # =====================
         # MEMORY CLEANUP (per step) - Critical for preventing OOM!
         # =====================
@@ -643,6 +888,23 @@ def grpo_train_loop_with_validation(
         if script_args.save_freq and epoch % script_args.save_freq == 0:
             save_path = os.path.join(script_args.output_dir, f"step_{epoch}")
             grpo_trainer.save_pretrained(save_path)
+    
+    # Final evaluation
+    if eval_classifier is not None and test_prompts is not None:
+        print(f"\n=== Final Evaluation ===")
+        eval_metrics = evaluate_toxicity_on_test_set(
+            model=grpo_trainer.model,
+            tokenizer=tokenizer,
+            test_prompts=test_prompts,
+            eval_classifier=eval_classifier,
+            device=device,
+            num_samples=script_args.eval_num_samples,
+            max_new_tokens=script_args.max_length - min_length,
+            generation_kwargs=generation_kwargs,
+        )
+        print(f"  Final toxicity: {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
+        print(f"  Final toxic fraction: {eval_metrics['eval/toxic_frac']:.4f}")
+        grpo_trainer.accelerator.log(eval_metrics)
     
     # Save final model
     final_path = os.path.join(script_args.output_dir, "final")
@@ -731,6 +993,30 @@ if __name__ == "__main__":
     ]
     print(f"\n--- Trainable Parameters: {len(trainable_params)} ---")
     
+    # ================================================================
+    # Load evaluation toxicity model (DIFFERENT from training reward model)
+    # This enables periodic during-training evaluation like Figure 7 in paper
+    # ================================================================
+    eval_classifier = None
+    test_prompts = None
+    
+    if script_args.eval_freq > 0:
+        try:
+            eval_classifier = load_eval_toxicity_model(
+                script_args.eval_toxicity_model,
+                grpo_trainer.current_device,
+            )
+            # Use held-out test prompts from the dataset split
+            test_prompts = val_question_tensors
+            print(f"  Test prompts for evaluation: {len(test_prompts)}")
+            print(f"  Eval frequency: every {script_args.eval_freq} steps")
+            print(f"  Eval samples per round: {script_args.eval_num_samples}")
+        except Exception as e:
+            print(f"WARNING: Could not load eval toxicity model: {e}")
+            print("  Continuing without periodic evaluation.")
+            eval_classifier = None
+            test_prompts = None
+    
     # Run training loop
     if script_args.tracin:
         if script_args.with_validation:
@@ -744,6 +1030,8 @@ if __name__ == "__main__":
                 val_question_tensors,
                 val_questions,
                 min_length=script_args.min_length,
+                eval_classifier=eval_classifier,
+                test_prompts=test_prompts,
             )
         else:
             print("\nRunning GRPO with TracIn (valid=train)...")
@@ -754,6 +1042,8 @@ if __name__ == "__main__":
                 tokenizer,
                 reward_tokenizer,
                 min_length=script_args.min_length,
+                eval_classifier=eval_classifier,
+                test_prompts=test_prompts,
             )
     else:
         print("\nRunning standard GRPO training...")
@@ -764,6 +1054,8 @@ if __name__ == "__main__":
             tokenizer,
             reward_tokenizer,
             min_length=script_args.min_length,
+            eval_classifier=eval_classifier,
+            test_prompts=test_prompts,
         )
     
     wandb.finish()
