@@ -1,6 +1,11 @@
 # GENERAL CODE FOR RLHF TRAINING ON OUR DIFFERENT SETTINGS
 
 import os
+import random
+import torch
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Optional
 from tqdm import tqdm
 from transformers import HfArgumentParser
 from trl import  PPOTrainer, set_seed
@@ -8,13 +13,88 @@ import wandb
 
 
 from rlhfutils.rl_utils import (
-    ScriptArguments,
+    ScriptArguments as _BaseScriptArguments,
     load_models,
     train_loop,
     train_loop_one_step,
     train_loop_with_validation,
-    load_eval_toxicity_model,
 )
+
+
+# Extend ScriptArguments with evaluation fields
+# (the installed rl_utils.py may not have these)
+@dataclass
+class ScriptArguments(_BaseScriptArguments):
+    eval_freq: Optional[int] = field(default=0, metadata={"help": "evaluate every N steps (0 to disable)"})
+    eval_num_samples: Optional[int] = field(default=256, metadata={"help": "number of test prompts to evaluate on"})
+    eval_toxicity_model: Optional[str] = field(default="s-nlp/roberta_toxicity_classifier", metadata={"help": "different toxicity detector for evaluation"})
+
+
+# ============================================================================
+# Evaluation functions (self-contained, no dependency on installed rl_utils)
+# ============================================================================
+def load_eval_toxicity_model(model_name, device):
+    """Load a DIFFERENT toxicity classifier for evaluation."""
+    from transformers import pipeline as hf_pipeline
+    print(f"\n=== Loading Evaluation Toxicity Model ===")
+    print(f"  Model: {model_name}")
+    print(f"  (Different from training reward model!)")
+    eval_classifier = hf_pipeline(
+        "text-classification", model=model_name,
+        device=device if isinstance(device, int) else 0,
+        batch_size=64, truncation=True, max_length=512,
+    )
+    print(f"  Eval toxicity model loaded successfully!")
+    return eval_classifier
+
+
+def evaluate_toxicity_on_test_set(ppo_trainer, tokenizer, test_prompts, eval_classifier,
+                                   device, num_samples=256, max_new_tokens=20, generation_kwargs=None):
+    """Evaluate model toxicity on held-out test set using a different toxicity detector."""
+    num_eval = min(num_samples, len(test_prompts))
+    sample_indices = random.sample(range(len(test_prompts)), num_eval)
+    eval_prompts = [test_prompts[i] for i in sample_indices]
+    if generation_kwargs is None:
+        generation_kwargs = {
+            "min_length": -1, "top_k": 0.0, "top_p": 1.0, "do_sample": True,
+            "pad_token_id": tokenizer.pad_token_id, "max_new_tokens": max_new_tokens, "temperature": 1.0,
+        }
+    all_texts = []
+    with torch.no_grad():
+        for bs in range(0, num_eval, 32):
+            be = min(bs + 32, num_eval)
+            batch = eval_prompts[bs:be]
+            gen_kw = {k: v for k, v in generation_kwargs.items()}
+            if "max_new_tokens" not in gen_kw:
+                gen_kw["max_new_tokens"] = max_new_tokens
+            resp = ppo_trainer.generate(batch, return_prompt=False, **gen_kw)
+            ptexts = tokenizer.batch_decode(batch, skip_special_tokens=True)
+            rtexts = tokenizer.batch_decode(resp, skip_special_tokens=True)
+            all_texts.extend([p + r for p, r in zip(ptexts, rtexts)])
+            del resp
+    if not all_texts:
+        return {"eval/toxicity_mean": 0.0, "eval/toxicity_std": 0.0, "eval/num_samples": 0}
+    toxicity_scores = []
+    for bs in range(0, len(all_texts), 64):
+        results = eval_classifier(all_texts[bs:bs + 64])
+        for result in results:
+            if isinstance(result, list):
+                sc = 0.0
+                for ld in result:
+                    lb = ld.get("label", "").lower()
+                    if "toxic" in lb or lb == "label_1":
+                        sc = ld["score"]; break
+                toxicity_scores.append(sc)
+            elif isinstance(result, dict):
+                lb = result.get("label", "").lower(); sc = result["score"]
+                toxicity_scores.append(sc if ("toxic" in lb or lb == "label_1") else 1.0 - sc)
+    ta = np.array(toxicity_scores)
+    return {
+        "eval/toxicity_mean": float(np.mean(ta)), "eval/toxicity_std": float(np.std(ta)),
+        "eval/toxicity_max": float(np.max(ta)), "eval/toxicity_min": float(np.min(ta)),
+        "eval/toxic_frac": float(np.mean(ta > 0.5)), "eval/num_samples": num_eval,
+    }
+
 
 from rlhfutils.data import (
     build_wgpt_promptdata,
@@ -166,12 +246,57 @@ if hasattr(script_args, 'eval_freq') and script_args.eval_freq > 0:
         eval_classifier = None
         test_prompts = None
 
+# ================================================================
+# Monkey-patch ppo_trainer.log_stats to inject periodic evaluation
+# This works regardless of which rl_utils.py version is installed.
+# ================================================================
+if eval_classifier is not None and test_prompts is not None:
+    _orig_log_stats = ppo_trainer.log_stats
+    _eval_step_counter = [0]  # mutable counter
+    _eval_freq = script_args.eval_freq
+    _eval_num_samples = script_args.eval_num_samples
+    _eval_max_new_tokens = script_args.max_length - script_args.min_length
+
+    def _patched_log_stats(stats, batch, rewards, columns_to_log=None):
+        # Call original log_stats first
+        if columns_to_log is not None:
+            _orig_log_stats(stats, batch, rewards, columns_to_log)
+        else:
+            _orig_log_stats(stats, batch, rewards)
+        
+        _eval_step_counter[0] += 1
+        step = _eval_step_counter[0]
+        
+        if step % _eval_freq == 0:
+            print(f"\n[Step {step}] Running evaluation on test set...")
+            eval_gen_kwargs = {
+                "min_length": -1, "top_k": 0.0, "top_p": 1.0, "do_sample": True,
+                "max_new_tokens": _eval_max_new_tokens,
+                "temperature": script_args.temperature,
+            }
+            eval_metrics = evaluate_toxicity_on_test_set(
+                ppo_trainer=ppo_trainer,
+                tokenizer=tokenizer,
+                test_prompts=test_prompts,
+                eval_classifier=eval_classifier,
+                device=eval_device,
+                num_samples=_eval_num_samples,
+                max_new_tokens=_eval_max_new_tokens,
+                generation_kwargs=eval_gen_kwargs,
+            )
+            print(f"  Eval toxicity: {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
+            print(f"  Toxic fraction (>0.5): {eval_metrics['eval/toxic_frac']:.4f}")
+            ppo_trainer.accelerator.log(eval_metrics)
+    
+    ppo_trainer.log_stats = _patched_log_stats
+    print("  ✓ Periodic eval hooked into ppo_trainer.log_stats")
+
 # TODO customize for different RM code, and different RM input formats
 # Run RL pipeline now
 if script_args.tracin:
     if script_args.with_validation:
         print("NOTE: TracIn with validation dataset")
-        train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer, rmformat, min_length=script_args.min_length, val_question_tensors=val_question_tensors, val_questions=val_questions, reward_tokenizer=reward_tokenizer, eval_classifier=eval_classifier, test_prompts=test_prompts)
+        train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer, rmformat, min_length=script_args.min_length, val_question_tensors=val_question_tensors, val_questions=val_questions, reward_tokenizer=reward_tokenizer)
     
     else:
         print("Note: TracIn with valid=train")
@@ -179,5 +304,5 @@ if script_args.tracin:
         
 else:
     print("NOTE: standard training without tracin selection")
-    train_loop(script_args, ppo_trainer, reward_model, tokenizer, rmformat, min_length=script_args.min_length, reward_tokenizer=reward_tokenizer, eval_classifier=eval_classifier, test_prompts=test_prompts)
+    train_loop(script_args, ppo_trainer, reward_model, tokenizer, rmformat, min_length=script_args.min_length, reward_tokenizer=reward_tokenizer)
 # train_loop_one_step(script_args, ppo_trainer, reward_model, tokenizer, rmformat)
