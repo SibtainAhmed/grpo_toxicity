@@ -60,6 +60,7 @@ def evaluate_toxicity_on_test_set(ppo_trainer, tokenizer, test_prompts, eval_cla
             "pad_token_id": tokenizer.pad_token_id, "max_new_tokens": max_new_tokens, "temperature": 1.0,
         }
     all_texts = []
+    ppo_trainer.model.eval()
     with torch.no_grad():
         for bs in range(0, num_eval, 32):
             be = min(bs + 32, num_eval)
@@ -67,11 +68,18 @@ def evaluate_toxicity_on_test_set(ppo_trainer, tokenizer, test_prompts, eval_cla
             gen_kw = {k: v for k, v in generation_kwargs.items()}
             if "max_new_tokens" not in gen_kw:
                 gen_kw["max_new_tokens"] = max_new_tokens
-            resp = ppo_trainer.generate(batch, return_prompt=False, **gen_kw)
-            ptexts = tokenizer.batch_decode(batch, skip_special_tokens=True)
-            rtexts = tokenizer.batch_decode(resp, skip_special_tokens=True)
-            all_texts.extend([p + r for p, r in zip(ptexts, rtexts)])
-            del resp
+            # Generate responses — PPOTrainer.generate returns full sequences (prompt+response)
+            full_resp = ppo_trainer.generate(batch, **gen_kw)
+            # Decode prompts and full responses separately to build full text
+            prompt_lens = [len(p) for p in batch]
+            for i, full_seq in enumerate(full_resp):
+                # Strip prompt tokens to get response-only, then concatenate as text
+                resp_tokens = full_seq[prompt_lens[i]:]
+                prompt_text = tokenizer.decode(batch[i], skip_special_tokens=True)
+                resp_text = tokenizer.decode(resp_tokens, skip_special_tokens=True)
+                all_texts.append(prompt_text + resp_text)
+            del full_resp
+    ppo_trainer.model.train()
     if not all_texts:
         return {"eval/toxicity_mean": 0.0, "eval/toxicity_std": 0.0, "eval/num_samples": 0}
     toxicity_scores = []
@@ -225,23 +233,29 @@ print(len(trainable_params))
 # ================================================================
 eval_classifier = None
 test_prompts = None
+eval_device = 0
 
 if hasattr(script_args, 'eval_freq') and script_args.eval_freq > 0:
     try:
-        from accelerate import Accelerator
-        eval_device = Accelerator().local_process_index
+        # Reuse ppo_trainer's accelerator instead of creating a new one
+        eval_device = ppo_trainer.accelerator.local_process_index
         eval_classifier = load_eval_toxicity_model(
             script_args.eval_toxicity_model,
             eval_device,
         )
         # Use held-out test prompts from the dataset split
-        if 'val_question_tensors' in dir():
+        try:
             test_prompts = val_question_tensors
             print(f"  Test prompts for evaluation: {len(test_prompts)}")
+        except NameError:
+            print("  WARNING: val_question_tensors not defined, no test prompts for eval")
+            test_prompts = None
         print(f"  Eval frequency: every {script_args.eval_freq} steps")
         print(f"  Eval samples per round: {script_args.eval_num_samples}")
     except Exception as e:
+        import traceback
         print(f"WARNING: Could not load eval toxicity model: {e}")
+        traceback.print_exc()
         print("  Continuing without periodic evaluation.")
         eval_classifier = None
         test_prompts = None
@@ -255,7 +269,8 @@ if eval_classifier is not None and test_prompts is not None:
     _eval_step_counter = [0]  # mutable counter
     _eval_freq = script_args.eval_freq
     _eval_num_samples = script_args.eval_num_samples
-    _eval_max_new_tokens = script_args.max_length - script_args.min_length
+    _eval_max_new_tokens = max(script_args.max_length - script_args.min_length, 10)
+    _eval_temperature = getattr(script_args, 'temperature', 1.0)
 
     def _patched_log_stats(stats, batch, rewards, columns_to_log=None):
         # Call original log_stats first
@@ -268,28 +283,38 @@ if eval_classifier is not None and test_prompts is not None:
         step = _eval_step_counter[0]
         
         if step % _eval_freq == 0:
-            print(f"\n[Step {step}] Running evaluation on test set...")
-            eval_gen_kwargs = {
-                "min_length": -1, "top_k": 0.0, "top_p": 1.0, "do_sample": True,
-                "max_new_tokens": _eval_max_new_tokens,
-                "temperature": script_args.temperature,
-            }
-            eval_metrics = evaluate_toxicity_on_test_set(
-                ppo_trainer=ppo_trainer,
-                tokenizer=tokenizer,
-                test_prompts=test_prompts,
-                eval_classifier=eval_classifier,
-                device=eval_device,
-                num_samples=_eval_num_samples,
-                max_new_tokens=_eval_max_new_tokens,
-                generation_kwargs=eval_gen_kwargs,
-            )
-            print(f"  Eval toxicity: {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
-            print(f"  Toxic fraction (>0.5): {eval_metrics['eval/toxic_frac']:.4f}")
-            ppo_trainer.accelerator.log(eval_metrics)
+            try:
+                print(f"\n[Step {step}] Running evaluation on test set...")
+                eval_gen_kwargs = {
+                    "min_length": -1, "top_k": 0.0, "top_p": 1.0, "do_sample": True,
+                    "max_new_tokens": _eval_max_new_tokens,
+                    "temperature": _eval_temperature,
+                }
+                eval_metrics = evaluate_toxicity_on_test_set(
+                    ppo_trainer=ppo_trainer,
+                    tokenizer=tokenizer,
+                    test_prompts=test_prompts,
+                    eval_classifier=eval_classifier,
+                    device=eval_device,
+                    num_samples=_eval_num_samples,
+                    max_new_tokens=_eval_max_new_tokens,
+                    generation_kwargs=eval_gen_kwargs,
+                )
+                print(f"  Eval toxicity: {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
+                print(f"  Toxic fraction (>0.5): {eval_metrics['eval/toxic_frac']:.4f}")
+                ppo_trainer.accelerator.log(eval_metrics)
+            except Exception as e:
+                print(f"  WARNING: Evaluation failed at step {step}: {e}")
+                import traceback
+                traceback.print_exc()
     
     ppo_trainer.log_stats = _patched_log_stats
     print("  ✓ Periodic eval hooked into ppo_trainer.log_stats")
+else:
+    if eval_classifier is None and hasattr(script_args, 'eval_freq') and script_args.eval_freq > 0:
+        print("  WARNING: eval_classifier is None, skipping periodic eval hook")
+    if test_prompts is None and eval_classifier is not None:
+        print("  WARNING: test_prompts is None, skipping periodic eval hook")
 
 # TODO customize for different RM code, and different RM input formats
 # Run RL pipeline now
