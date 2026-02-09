@@ -145,6 +145,11 @@ class ScriptArguments:
     run_name: Optional[str] = field(default="llamatrl", metadata={"help": "wandb run name"})
     val_strategy: Optional[str] = field(default="random", metadata={"help": "rollout strategy, start with high var, high mean, etc"})
     gen_data_dir: Optional[str] = field(default=None, metadata={"help": "directory to save generated data"})
+    
+    # Evaluation params (periodic test-set eval with different toxicity detector)
+    eval_freq: Optional[int] = field(default=0, metadata={"help": "evaluate every N steps (0 to disable)"})
+    eval_num_samples: Optional[int] = field(default=256, metadata={"help": "number of test prompts to evaluate on"})
+    eval_toxicity_model: Optional[str] = field(default="s-nlp/roberta_toxicity_classifier", metadata={"help": "different toxicity detector for evaluation"})
 
 
 @dataclass
@@ -811,7 +816,151 @@ def process_reward(texts, rmname, reward_model, script_args, response_tensors, m
         rewards = [rewards[i]+radds[i] for i in range(len(radds))]
     return rewards
 
-def train_loop(script_args, ppo_trainer, reward_model, tokenizer, qaform, min_length=20, reward_tokenizer=None):
+# ============================================================================
+# During-training Evaluation (different test set + different toxicity detector)
+# Mimics the paper's Figure 7: periodic toxicity evaluation on held-out test set
+# ============================================================================
+
+def load_eval_toxicity_model(model_name, device):
+    """
+    Load a DIFFERENT toxicity classifier for evaluation.
+    This is distinct from the training reward model to avoid reward hacking.
+    
+    Training reward model: facebook/roberta-hate-speech-dynabench-r4-target
+    Eval toxicity model: s-nlp/roberta_toxicity_classifier (or configurable)
+    """
+    from transformers import pipeline as hf_pipeline
+    
+    print(f"\n=== Loading Evaluation Toxicity Model ===")
+    print(f"  Model: {model_name}")
+    print(f"  (Different from training reward model!)")
+    
+    eval_classifier = hf_pipeline(
+        "text-classification",
+        model=model_name,
+        device=device if isinstance(device, int) else 0,
+        batch_size=64,
+        truncation=True,
+        max_length=512,
+    )
+    
+    print(f"  Eval toxicity model loaded successfully!")
+    return eval_classifier
+
+
+def evaluate_toxicity_on_test_set(
+    ppo_trainer,
+    tokenizer,
+    test_prompts,
+    eval_classifier,
+    device,
+    num_samples=256,
+    max_new_tokens=20,
+    generation_kwargs=None,
+):
+    """
+    Evaluate the current model's toxicity on a held-out test set using
+    a DIFFERENT toxicity detector than the training reward model.
+    
+    This gives an unbiased measure of whether toxicity is truly decreasing,
+    not just that the model learned to game the specific reward model.
+    
+    Works with both PPO (AutoModelForCausalLMWithValueHead) and GRPO models.
+    """
+    import numpy as np
+    
+    # Sample test prompts
+    num_available = len(test_prompts)
+    num_eval = min(num_samples, num_available)
+    sample_indices = random.sample(range(num_available), num_eval)
+    
+    eval_prompts = [test_prompts[i] for i in sample_indices]
+    
+    if generation_kwargs is None:
+        generation_kwargs = {
+            "min_length": -1,
+            "top_k": 0.0,
+            "top_p": 1.0,
+            "do_sample": True,
+            "pad_token_id": tokenizer.pad_token_id,
+            "max_new_tokens": max_new_tokens,
+            "temperature": 1.0,
+        }
+    
+    # Generate responses using ppo_trainer.generate() in batches
+    all_texts = []
+    gen_batch_size = 32
+    
+    with torch.no_grad():
+        for batch_start in range(0, num_eval, gen_batch_size):
+            batch_end = min(batch_start + gen_batch_size, num_eval)
+            batch_prompts = eval_prompts[batch_start:batch_end]
+            
+            # Use ppo_trainer.generate for proper model access
+            eval_gen_kwargs = {k: v for k, v in generation_kwargs.items()}
+            # Make sure we have max_new_tokens
+            if "max_new_tokens" not in eval_gen_kwargs:
+                eval_gen_kwargs["max_new_tokens"] = max_new_tokens
+            
+            response_tensors = ppo_trainer.generate(
+                batch_prompts,
+                return_prompt=False,
+                **eval_gen_kwargs,
+            )
+            
+            # Decode prompt + response for full text
+            prompt_texts = tokenizer.batch_decode(batch_prompts, skip_special_tokens=True)
+            response_texts = tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
+            
+            for p_text, r_text in zip(prompt_texts, response_texts):
+                all_texts.append(p_text + r_text)
+            
+            del response_tensors
+    
+    if len(all_texts) == 0:
+        return {"eval/toxicity_mean": 0.0, "eval/toxicity_std": 0.0, "eval/num_samples": 0}
+    
+    # Score toxicity using the DIFFERENT detector
+    toxicity_scores = []
+    
+    for batch_start in range(0, len(all_texts), 64):
+        batch_end = min(batch_start + 64, len(all_texts))
+        batch_texts = all_texts[batch_start:batch_end]
+        
+        results = eval_classifier(batch_texts)
+        
+        for result in results:
+            if isinstance(result, list):
+                toxic_score = 0.0
+                for label_dict in result:
+                    label = label_dict.get("label", "").lower()
+                    if "toxic" in label or label == "label_1":
+                        toxic_score = label_dict["score"]
+                        break
+                toxicity_scores.append(toxic_score)
+            elif isinstance(result, dict):
+                label = result.get("label", "").lower()
+                score = result["score"]
+                if "toxic" in label or label == "label_1":
+                    toxicity_scores.append(score)
+                else:
+                    toxicity_scores.append(1.0 - score)
+    
+    toxicity_array = np.array(toxicity_scores)
+    
+    eval_metrics = {
+        "eval/toxicity_mean": float(np.mean(toxicity_array)),
+        "eval/toxicity_std": float(np.std(toxicity_array)),
+        "eval/toxicity_max": float(np.max(toxicity_array)),
+        "eval/toxicity_min": float(np.min(toxicity_array)),
+        "eval/toxic_frac": float(np.mean(toxicity_array > 0.5)),
+        "eval/num_samples": num_eval,
+    }
+    
+    return eval_metrics
+
+
+def train_loop(script_args, ppo_trainer, reward_model, tokenizer, qaform, min_length=20, reward_tokenizer=None, eval_classifier=None, test_prompts=None):
     
     # global likemod, liketok, slikemod, sliketok
     
@@ -1078,6 +1227,30 @@ def train_loop(script_args, ppo_trainer, reward_model, tokenizer, qaform, min_le
             
         ppo_trainer.log_stats(stats, batch, logrewards)
         print("e")
+        
+        # === Periodic Evaluation on held-out test set with different toxicity detector ===
+        if (eval_classifier is not None and test_prompts is not None 
+                and script_args.eval_freq > 0 and (epoch+1) % script_args.eval_freq == 0):
+            print(f"\n[Step {epoch+1}] Running evaluation on test set...")
+            eval_gen_kwargs = {
+                "min_length": -1, "top_k": 0.0, "top_p": 1.0, "do_sample": True,
+                "max_new_tokens": script_args.max_length - min_length,
+                "temperature": script_args.temperature,
+            }
+            eval_metrics = evaluate_toxicity_on_test_set(
+                ppo_trainer=ppo_trainer,
+                tokenizer=tokenizer,
+                test_prompts=test_prompts,
+                eval_classifier=eval_classifier,
+                device=current_device,
+                num_samples=script_args.eval_num_samples,
+                max_new_tokens=script_args.max_length - min_length,
+                generation_kwargs=eval_gen_kwargs,
+            )
+            print(f"  Eval toxicity: {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
+            print(f"  Toxic fraction (>0.5): {eval_metrics['eval/toxic_frac']:.4f}")
+            ppo_trainer.accelerator.log(eval_metrics)
+        
         if script_args.save_freq and (epoch+1) % script_args.save_freq == 0:
             ppo_trainer.save_pretrained(script_args.output_dir + f"step_{epoch+1}")
             
@@ -1406,7 +1579,7 @@ def train_loop_one_step(script_args, ppo_trainer, reward_model, tokenizer, qafor
         if script_args.save_freq and (epoch+1) % script_args.save_freq == 0:
             ppo_trainer.save_pretrained(script_args.output_dir + f"step_{epoch+1}")
 
-def train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer, qaform, min_length=20, val_question_tensors=None, val_questions=None, reward_tokenizer=None):
+def train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer, qaform, min_length=20, val_question_tensors=None, val_questions=None, reward_tokenizer=None, eval_classifier=None, test_prompts=None):
     
     # global likemod, liketok, slikemod, sliketok
     
@@ -1741,6 +1914,30 @@ def train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer
             
         ppo_trainer.log_stats(stats, batch, logrewards)
         print("e")
+        
+        # === Periodic Evaluation on held-out test set with different toxicity detector ===
+        if (eval_classifier is not None and test_prompts is not None 
+                and script_args.eval_freq > 0 and (epoch+1) % script_args.eval_freq == 0):
+            print(f"\n[Step {epoch+1}] Running evaluation on test set...")
+            eval_gen_kwargs = {
+                "min_length": -1, "top_k": 0.0, "top_p": 1.0, "do_sample": True,
+                "max_new_tokens": script_args.max_length - min_length,
+                "temperature": script_args.temperature,
+            }
+            eval_metrics = evaluate_toxicity_on_test_set(
+                ppo_trainer=ppo_trainer,
+                tokenizer=tokenizer,
+                test_prompts=test_prompts,
+                eval_classifier=eval_classifier,
+                device=current_device,
+                num_samples=script_args.eval_num_samples,
+                max_new_tokens=script_args.max_length - min_length,
+                generation_kwargs=eval_gen_kwargs,
+            )
+            print(f"  Eval toxicity: {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
+            print(f"  Toxic fraction (>0.5): {eval_metrics['eval/toxic_frac']:.4f}")
+            ppo_trainer.accelerator.log(eval_metrics)
+        
         if script_args.save_freq and (epoch+1) % script_args.save_freq == 0:
             ppo_trainer.save_pretrained(script_args.output_dir + f"step_{epoch+1}")
         

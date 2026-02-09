@@ -28,4 +28,7 @@ accelerate launch --main_process_port=29524 \
     --tracin \
     --with_validation \
     --val_loss_type="seqloss-lastadv" \
+    --eval_freq=10 \
+    --eval_num_samples=256 \
+    --eval_toxicity_model="s-nlp/roberta_toxicity_classifier" \
     --gen_data_dir="gen_tox_all_samples_tracin_2.7b_bfloat16_kl-0.04_val-1024_tgt-seqloss-lastadv_mbs-1_seed-22"

@@ -12,7 +12,8 @@ from rlhfutils.rl_utils import (
     load_models,
     train_loop,
     train_loop_one_step,
-    train_loop_with_validation
+    train_loop_with_validation,
+    load_eval_toxicity_model,
 )
 
 from rlhfutils.data import (
@@ -138,12 +139,39 @@ print(len(trainable_params))
 # print('vhead type')
 # print(isinstance(ppo_trainer.model.module.v_head.summary, torch.nn.Linear))
 
+# ================================================================
+# Load evaluation toxicity model (DIFFERENT from training reward model)
+# This enables periodic during-training evaluation like Figure 7 in paper
+# ================================================================
+eval_classifier = None
+test_prompts = None
+
+if hasattr(script_args, 'eval_freq') and script_args.eval_freq > 0:
+    try:
+        from accelerate import Accelerator
+        eval_device = Accelerator().local_process_index
+        eval_classifier = load_eval_toxicity_model(
+            script_args.eval_toxicity_model,
+            eval_device,
+        )
+        # Use held-out test prompts from the dataset split
+        if 'val_question_tensors' in dir():
+            test_prompts = val_question_tensors
+            print(f"  Test prompts for evaluation: {len(test_prompts)}")
+        print(f"  Eval frequency: every {script_args.eval_freq} steps")
+        print(f"  Eval samples per round: {script_args.eval_num_samples}")
+    except Exception as e:
+        print(f"WARNING: Could not load eval toxicity model: {e}")
+        print("  Continuing without periodic evaluation.")
+        eval_classifier = None
+        test_prompts = None
+
 # TODO customize for different RM code, and different RM input formats
 # Run RL pipeline now
 if script_args.tracin:
     if script_args.with_validation:
         print("NOTE: TracIn with validation dataset")
-        train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer, rmformat, min_length=script_args.min_length, val_question_tensors=val_question_tensors, val_questions=val_questions, reward_tokenizer=reward_tokenizer)
+        train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer, rmformat, min_length=script_args.min_length, val_question_tensors=val_question_tensors, val_questions=val_questions, reward_tokenizer=reward_tokenizer, eval_classifier=eval_classifier, test_prompts=test_prompts)
     
     else:
         print("Note: TracIn with valid=train")
@@ -151,5 +179,5 @@ if script_args.tracin:
         
 else:
     print("NOTE: standard training without tracin selection")
-    train_loop(script_args, ppo_trainer, reward_model, tokenizer, rmformat, min_length=script_args.min_length, reward_tokenizer=reward_tokenizer)
+    train_loop(script_args, ppo_trainer, reward_model, tokenizer, rmformat, min_length=script_args.min_length, reward_tokenizer=reward_tokenizer, eval_classifier=eval_classifier, test_prompts=test_prompts)
 # train_loop_one_step(script_args, ppo_trainer, reward_model, tokenizer, rmformat)

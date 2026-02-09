@@ -24,4 +24,7 @@ accelerate launch --main_process_port=29522 \
     --min_length=20 \
     --wandb_project="ppo-detox" \
     --run_name="std-2.7b-bfloat16_kl-0.04_mbs-1_seed-22" \
+    --eval_freq=20 \
+    --eval_num_samples=256 \
+    --eval_toxicity_model="s-nlp/roberta_toxicity_classifier" \
     --gen_data_dir="gen_tox_all_samples_std_2.7b_bfloat16_kl-0.04_mbs-1_seed-22" \
