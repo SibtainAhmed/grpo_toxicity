@@ -316,12 +316,39 @@ else:
     if test_prompts is None and eval_classifier is not None:
         print("  WARNING: test_prompts is None, skipping periodic eval hook")
 
+# ================================================================
+# Build eval kwargs dict — pass eval params to training loops if they support them
+# This provides a SECOND path for eval (in addition to the monkey-patch above)
+# ================================================================
+import inspect
+
+_eval_kwargs = {}
+if eval_classifier is not None and test_prompts is not None:
+    _eval_kwargs = {'eval_classifier': eval_classifier, 'test_prompts': test_prompts}
+
+def _get_eval_kwargs(func):
+    """Return eval kwargs only if the function accepts them."""
+    try:
+        sig = inspect.signature(func)
+        if 'eval_classifier' in sig.parameters:
+            return _eval_kwargs
+    except (ValueError, TypeError):
+        pass
+    return {}
+
 # TODO customize for different RM code, and different RM input formats
 # Run RL pipeline now
 if script_args.tracin:
     if script_args.with_validation:
         print("NOTE: TracIn with validation dataset")
-        train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer, rmformat, min_length=script_args.min_length, val_question_tensors=val_question_tensors, val_questions=val_questions, reward_tokenizer=reward_tokenizer)
+        train_loop_with_validation(
+            script_args, ppo_trainer, reward_model, tokenizer, rmformat,
+            min_length=script_args.min_length,
+            val_question_tensors=val_question_tensors,
+            val_questions=val_questions,
+            reward_tokenizer=reward_tokenizer,
+            **_get_eval_kwargs(train_loop_with_validation),
+        )
     
     else:
         print("Note: TracIn with valid=train")
@@ -329,5 +356,10 @@ if script_args.tracin:
         
 else:
     print("NOTE: standard training without tracin selection")
-    train_loop(script_args, ppo_trainer, reward_model, tokenizer, rmformat, min_length=script_args.min_length, reward_tokenizer=reward_tokenizer)
+    train_loop(
+        script_args, ppo_trainer, reward_model, tokenizer, rmformat,
+        min_length=script_args.min_length,
+        reward_tokenizer=reward_tokenizer,
+        **_get_eval_kwargs(train_loop),
+    )
 # train_loop_one_step(script_args, ppo_trainer, reward_model, tokenizer, rmformat)
