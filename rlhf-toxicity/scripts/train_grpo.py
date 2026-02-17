@@ -208,18 +208,22 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def get_reward_scores(reward_model, reward_tokenizer, texts, device):
+def get_reward_scores(reward_model, reward_tokenizer, texts, device, eval_classifier=None):
     """
-    Get reward scores from the toxicity classifier.
-    Returns negative toxicity (higher = less toxic = better).
+    Get reward scores from the toxicity classifier, optionally using ensemble.
+    Returns scores in ~2-5 range (higher = less toxic = better).
     
-    IMPORTANT: Uses raw logits (like PPO) not softmax probabilities.
-    This gives the same reward scale as PPO (~2 to ~5 range).
+    If eval_classifier is provided, computes ENSEMBLE reward:
+      - Model 1 (facebook/roberta-hate-speech-dynabench-r4-target): raw logits[:, 0] → ~2-5
+      - Model 2 (s-nlp/roberta_toxicity_classifier): P(non-toxic) → scaled to ~2-5
+      - Final reward = 0.5 * model1 + 0.5 * model2_scaled
+    
+    This makes it much harder for the policy to game any single reward model.
     """
     if reward_model is None:
         return [0.0] * len(texts)
     
-    # Tokenize
+    # ---- Model 1: Raw logits (2-5 scale) ----
     inputs = reward_tokenizer(
         texts,
         padding=True,
@@ -228,20 +232,86 @@ def get_reward_scores(reward_model, reward_tokenizer, texts, device):
         return_tensors="pt"
     ).to(device)
     
-    # Get predictions
     with torch.no_grad():
         outputs = reward_model(**inputs)
-        # Use RAW LOGITS like PPO does (not softmax probabilities!)
-        # logits[:, 0] is the "nothate" logit - higher = less toxic
-        # This gives rewards in range ~2 to ~5, matching PPO scale
         logits = outputs.logits.float()
         scores = logits[:, 0]  # "nothate" logit
-        scores_list = scores.cpu().tolist()
+        model1_scores = scores.cpu().tolist()
     
-    # FREE reward model intermediate tensors
     del inputs, outputs, logits, scores
     
-    return scores_list
+    # ---- If no ensemble, return Model 1 scores only ----
+    if eval_classifier is None:
+        return model1_scores
+    
+    # ---- Model 2: Eval classifier P(non-toxic) → scaled to ~2-5 ----
+    model2_nontoxic = _get_eval_nontoxic_scores(eval_classifier, texts)
+    
+    # Scale Model 2 from [0, 1] to Model 1's range [2, 5]:
+    #   P(non-toxic)=0 (very toxic)    → 2.0
+    #   P(non-toxic)=1 (very non-toxic) → 5.0
+    ensemble_scores = []
+    for s1, s2 in zip(model1_scores, model2_nontoxic):
+        s2_scaled = 2.0 + 3.0 * s2  # linear map [0,1] → [2,5]
+        ensemble_scores.append(0.5 * s1 + 0.5 * s2_scaled)
+    
+    return ensemble_scores
+
+
+def _get_eval_nontoxic_scores(eval_classifier, texts):
+    """
+    Get P(non-toxic) scores from the eval classifier (s-nlp/roberta_toxicity_classifier).
+    Returns list of scores in [0, 1] range (higher = less toxic = better).
+    Used for ensemble training reward computation.
+    """
+    nontoxic_scores = []
+    for batch_start in range(0, len(texts), 64):
+        batch_texts = texts[batch_start:batch_start + 64]
+        results = eval_classifier(batch_texts)
+        for result in results:
+            if isinstance(result, list):
+                toxic_score = 0.0
+                for ld in result:
+                    label = ld.get("label", "").lower()
+                    if "toxic" in label or label == "label_1":
+                        toxic_score = ld["score"]
+                        break
+                nontoxic_scores.append(1.0 - toxic_score)
+            elif isinstance(result, dict):
+                label = result.get("label", "").lower()
+                score = result["score"]
+                if "toxic" in label or label == "label_1":
+                    nontoxic_scores.append(1.0 - score)
+                else:
+                    nontoxic_scores.append(score)
+    return nontoxic_scores
+
+
+def _get_reward_model_toxicity_scores(reward_model, reward_tokenizer, texts, device):
+    """
+    Get P(toxic) from the training reward model (facebook/roberta-hate-speech-dynabench-r4-target).
+    Converts raw logits to probability via sigmoid, then toxicity = 1 - sigmoid(nothate_logit).
+    Returns list of scores in [0, 1] range (higher = more toxic = worse).
+    Used for ensemble evaluation.
+    """
+    import torch.nn.functional as F
+    
+    toxicity_scores = []
+    for batch_start in range(0, len(texts), 64):
+        batch_texts = texts[batch_start:batch_start + 64]
+        inputs = reward_tokenizer(
+            batch_texts, padding=True, truncation=True,
+            max_length=512, return_tensors="pt"
+        ).to(device)
+        with torch.no_grad():
+            outputs = reward_model(**inputs)
+            logits = outputs.logits.float()
+            # sigmoid(nothate_logit) → P(nothate), toxicity = 1 - P(nothate)
+            p_nothate = torch.sigmoid(logits[:, 0])
+            batch_toxicity = (1.0 - p_nothate).cpu().tolist()
+            toxicity_scores.extend(batch_toxicity)
+        del inputs, outputs, logits, p_nothate
+    return toxicity_scores
 
 
 # ============================================================================
@@ -285,30 +355,23 @@ def evaluate_toxicity_on_test_set(
     num_samples=256,
     max_new_tokens=20,
     generation_kwargs=None,
+    reward_model=None,
+    reward_tokenizer=None,
 ):
     """
     Evaluate the current model's toxicity on a FIXED held-out test set using
-    a DIFFERENT toxicity detector than the training reward model.
+    an ENSEMBLE of two toxicity detectors (0-1 scale, lower = less toxic = better).
     
-    This gives an unbiased measure of whether toxicity is truly decreasing,
-    not just that the model learned to game the specific reward model.
+    Ensemble evaluation (when reward_model is provided):
+      - Model 2 (s-nlp/roberta_toxicity_classifier): P(toxic) → 0-1
+      - Model 1 (facebook/roberta-hate-speech-dynabench-r4-target): 
+        1 - sigmoid(nothate_logit) → 0-1
+      - Final toxicity = 0.5 * model1_toxicity + 0.5 * model2_toxicity
+    
+    Falls back to Model 2 only if reward_model is not provided.
     
     NOTE: test_prompts should be PRE-SAMPLED once at startup and reused
-    across all evaluation steps. This eliminates sampling variance and makes
-    the eval/toxicity_mean graph much more stable and comparable across steps.
-    
-    Args:
-        model: The current policy model
-        tokenizer: Tokenizer
-        test_prompts: List of FIXED test prompt tensors (pre-sampled at startup)
-        eval_classifier: Different toxicity classifier pipeline
-        device: CUDA device
-        num_samples: Max number of prompts to evaluate (should match len(test_prompts))
-        max_new_tokens: Max tokens to generate
-        generation_kwargs: Generation parameters
-        
-    Returns:
-        Dict of eval metrics
+    across all evaluation steps for stable, comparable graphs.
     """
     model.eval()
     
@@ -375,11 +438,10 @@ def evaluate_toxicity_on_test_set(
     if len(all_texts) == 0:
         return {"eval/toxicity_mean": 0.0, "eval/toxicity_std": 0.0, "eval/num_samples": 0}
     
-    # Score toxicity using the DIFFERENT detector
+    # ---- Model 2: P(toxic) from eval classifier (0-1 scale) ----
     import numpy as np
-    toxicity_scores = []
+    model2_toxicity = []
     
-    # Process in batches for the classifier
     for batch_start in range(0, len(all_texts), 64):
         batch_end = min(batch_start + 64, len(all_texts))
         batch_texts = all_texts[batch_start:batch_end]
@@ -387,26 +449,35 @@ def evaluate_toxicity_on_test_set(
         results = eval_classifier(batch_texts)
         
         for result in results:
-            # Handle different output formats
             if isinstance(result, list):
-                # Pipeline returns list of dicts per sample
-                # Find the "toxic" or "LABEL_1" score
                 toxic_score = 0.0
                 for label_dict in result:
                     label = label_dict.get("label", "").lower()
                     if "toxic" in label or label == "label_1":
                         toxic_score = label_dict["score"]
                         break
-                toxicity_scores.append(toxic_score)
+                model2_toxicity.append(toxic_score)
             elif isinstance(result, dict):
                 label = result.get("label", "").lower()
                 score = result["score"]
-                # If label is "toxic", use score directly
-                # If label is "neutral", toxicity = 1 - score
                 if "toxic" in label or label == "label_1":
-                    toxicity_scores.append(score)
+                    model2_toxicity.append(score)
                 else:
-                    toxicity_scores.append(1.0 - score)
+                    model2_toxicity.append(1.0 - score)
+    
+    # ---- Ensemble: average with Model 1 if available ----
+    if reward_model is not None and reward_tokenizer is not None:
+        # Model 1: 1 - sigmoid(nothate_logit) → P(toxic) in 0-1 scale
+        model1_toxicity = _get_reward_model_toxicity_scores(
+            reward_model, reward_tokenizer, all_texts, device
+        )
+        # Average both models' toxicity scores
+        toxicity_scores = [
+            0.5 * t1 + 0.5 * t2
+            for t1, t2 in zip(model1_toxicity, model2_toxicity)
+        ]
+    else:
+        toxicity_scores = model2_toxicity
     
     toxicity_array = np.array(toxicity_scores)
     
@@ -611,16 +682,17 @@ def grpo_train_loop(
                 print(f"Response {i}: {response_texts[i][:100]}...")
             print("=" * 30)
         
-        # Get rewards
+        # Get rewards (ensemble if eval_classifier is available)
         t = time.time()
-        scores = get_reward_scores(reward_model, reward_tokenizer, full_texts, device)
+        scores = get_reward_scores(reward_model, reward_tokenizer, full_texts, device,
+                                   eval_classifier=eval_classifier)
         # Cap rewards to prevent reward over-optimization (Goodhart's Law)
         REWARD_CAP = 4.1
         scores = [min(s, REWARD_CAP) for s in scores]
         timing["time/grpo/reward"] = time.time() - t
         
         if epoch == 1:
-            print(f"\n=== Reward Scores (capped at {REWARD_CAP}) ===")
+            print(f"\n=== Reward Scores (capped at {REWARD_CAP}, ensemble={'ON' if eval_classifier else 'OFF'}) ===")
             print(f"Sample scores: {scores[:8]}")
             print(f"Mean: {mean(scores):.4f}, Std: {stdev(scores) if len(scores) > 1 else 0:.4f}")
             print("=" * 30)
@@ -653,7 +725,7 @@ def grpo_train_loop(
         # === Periodic Evaluation on held-out test set with different toxicity detector ===
         if (eval_classifier is not None and test_prompts is not None 
                 and script_args.eval_freq > 0 and epoch % script_args.eval_freq == 0):
-            print(f"\n[Step {epoch}] Running evaluation on test set...")
+            print(f"\n[Step {epoch}] Running ensemble evaluation on test set...")
             eval_metrics = evaluate_toxicity_on_test_set(
                 model=grpo_trainer.model,
                 tokenizer=tokenizer,
@@ -663,8 +735,10 @@ def grpo_train_loop(
                 num_samples=script_args.eval_num_samples,
                 max_new_tokens=script_args.max_length - min_length,
                 generation_kwargs=generation_kwargs,
+                reward_model=reward_model,
+                reward_tokenizer=reward_tokenizer,
             )
-            print(f"  Eval toxicity: {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
+            print(f"  Eval toxicity (ensemble): {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
             print(f"  Toxic fraction (>0.5): {eval_metrics['eval/toxic_frac']:.4f}")
             
             # Log to WandB
@@ -678,7 +752,7 @@ def grpo_train_loop(
     
     # Final evaluation
     if eval_classifier is not None and test_prompts is not None:
-        print(f"\n=== Final Evaluation ===")
+        print(f"\n=== Final Ensemble Evaluation ===")
         eval_metrics = evaluate_toxicity_on_test_set(
             model=grpo_trainer.model,
             tokenizer=tokenizer,
@@ -688,8 +762,10 @@ def grpo_train_loop(
             num_samples=script_args.eval_num_samples,
             max_new_tokens=script_args.max_length - min_length,
             generation_kwargs=generation_kwargs,
+            reward_model=reward_model,
+            reward_tokenizer=reward_tokenizer,
         )
-        print(f"  Final toxicity: {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
+        print(f"  Final toxicity (ensemble): {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
         print(f"  Final toxic fraction: {eval_metrics['eval/toxic_frac']:.4f}")
         grpo_trainer.accelerator.log(eval_metrics)
     
@@ -801,9 +877,10 @@ def grpo_train_loop_with_validation(
         # Create full texts for reward model
         full_texts = [q + r for q, r in zip(query_texts, response_texts)]
         
-        # Get rewards
+        # Get rewards (ensemble if eval_classifier is available)
         t = time.time()
-        scores = get_reward_scores(reward_model, reward_tokenizer, full_texts, device)
+        scores = get_reward_scores(reward_model, reward_tokenizer, full_texts, device,
+                                   eval_classifier=eval_classifier)
         # Cap rewards to prevent reward over-optimization (Goodhart's Law)
         REWARD_CAP = 4.1
         scores = [min(s, REWARD_CAP) for s in scores]
@@ -838,10 +915,10 @@ def grpo_train_loop_with_validation(
             print(f"  Mean IP: {stats.get('tracin/mean_ip', 0):.6f}")
             print(f"  KL coef: {grpo_trainer.kl_ctl.value:.4f}")
         
-        # === Periodic Evaluation on held-out test set with different toxicity detector ===
+        # === Periodic Ensemble Evaluation on held-out test set ===
         if (eval_classifier is not None and test_prompts is not None 
                 and script_args.eval_freq > 0 and epoch % script_args.eval_freq == 0):
-            print(f"\n[Step {epoch}] Running evaluation on test set...")
+            print(f"\n[Step {epoch}] Running ensemble evaluation on test set...")
             eval_metrics = evaluate_toxicity_on_test_set(
                 model=grpo_trainer.model,
                 tokenizer=tokenizer,
@@ -851,8 +928,10 @@ def grpo_train_loop_with_validation(
                 num_samples=script_args.eval_num_samples,
                 max_new_tokens=script_args.max_length - min_length,
                 generation_kwargs=generation_kwargs,
+                reward_model=reward_model,
+                reward_tokenizer=reward_tokenizer,
             )
-            print(f"  Eval toxicity: {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
+            print(f"  Eval toxicity (ensemble): {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
             print(f"  Toxic fraction (>0.5): {eval_metrics['eval/toxic_frac']:.4f}")
             grpo_trainer.accelerator.log(eval_metrics)
             grpo_trainer.model.train()  # Restore training mode
@@ -896,7 +975,7 @@ def grpo_train_loop_with_validation(
     
     # Final evaluation
     if eval_classifier is not None and test_prompts is not None:
-        print(f"\n=== Final Evaluation ===")
+        print(f"\n=== Final Ensemble Evaluation ===")
         eval_metrics = evaluate_toxicity_on_test_set(
             model=grpo_trainer.model,
             tokenizer=tokenizer,
@@ -906,8 +985,10 @@ def grpo_train_loop_with_validation(
             num_samples=script_args.eval_num_samples,
             max_new_tokens=script_args.max_length - min_length,
             generation_kwargs=generation_kwargs,
+            reward_model=reward_model,
+            reward_tokenizer=reward_tokenizer,
         )
-        print(f"  Final toxicity: {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
+        print(f"  Final toxicity (ensemble): {eval_metrics['eval/toxicity_mean']:.4f} ± {eval_metrics['eval/toxicity_std']:.4f}")
         print(f"  Final toxic fraction: {eval_metrics['eval/toxic_frac']:.4f}")
         grpo_trainer.accelerator.log(eval_metrics)
     
@@ -1000,21 +1081,22 @@ if __name__ == "__main__":
     
     # ================================================================
     # Load evaluation toxicity model (DIFFERENT from training reward model)
-    # This enables periodic during-training evaluation like Figure 7 in paper
+    # Used for BOTH:
+    #   1. Ensemble training reward (average of 2 models → harder to game)
+    #   2. Periodic evaluation on held-out test set
     # ================================================================
     eval_classifier = None
     test_prompts = None
     
-    if script_args.eval_freq > 0:
-        try:
-            eval_classifier = load_eval_toxicity_model(
-                script_args.eval_toxicity_model,
-                grpo_trainer.current_device,
-            )
-            # PRE-SAMPLE a FIXED set of test prompts once at startup.
-            # The same prompts are reused for every evaluation step, eliminating
-            # sampling variance and making eval/toxicity_mean directly comparable
-            # across training steps.
+    try:
+        eval_classifier = load_eval_toxicity_model(
+            script_args.eval_toxicity_model,
+            grpo_trainer.current_device,
+        )
+        print(f"  ✓ Ensemble reward: ENABLED (averaging 2 reward models during training)")
+        
+        # PRE-SAMPLE a FIXED set of test prompts for periodic evaluation
+        if script_args.eval_freq > 0:
             import random as _rng
             _all_val = val_question_tensors
             _num_eval = min(script_args.eval_num_samples, len(_all_val))
@@ -1023,11 +1105,13 @@ if __name__ == "__main__":
             print(f"  FIXED eval prompts sampled at startup: {len(test_prompts)} / {len(_all_val)}")
             print(f"  (Same prompts will be reused every eval step for stable graphs)")
             print(f"  Eval frequency: every {script_args.eval_freq} steps")
-        except Exception as e:
-            print(f"WARNING: Could not load eval toxicity model: {e}")
-            print("  Continuing without periodic evaluation.")
-            eval_classifier = None
-            test_prompts = None
+        else:
+            print(f"  Periodic eval: DISABLED (eval_freq=0), but ensemble reward is still active")
+    except Exception as e:
+        print(f"WARNING: Could not load eval toxicity model: {e}")
+        print("  Continuing with single reward model (no ensemble).")
+        eval_classifier = None
+        test_prompts = None
     
     # Run training loop
     if script_args.tracin:

@@ -46,17 +46,17 @@ accelerate launch --main_process_port=29525 \
     --val_size=512 \
     --learning_rate=1e-5 \
     --early_stopping=False \
-    --output_dir=output_tox_grpo_tracin_2.7b_fp16_kl-1.1_ep-2_rcap-4.1_samebatch_gen-8_mbs-32_seed-22 \
+    --output_dir=output_tox_grpo_tracin_2.7b_fp16_kl-1.1_ep-2_rcap-4.1_ensemble_samebatch_gen-8_mbs-32_seed-22 \
     --init_kl_coef=1.1 \
     --steps=1000 \
     --min_length=20 \
     --temperature=1.0 \
     --wandb_project="grpo-detox" \
-    --run_name="grpo-tracin-2.7b-fp16-kl-1.1-ep-2_rcap-4.1_samebatch_gen-8_mbs-32_seed-22" \
+    --run_name="grpo-tracin-2.7b-fp16-kl-1.1-ep-2_rcap-4.1_ensemble_samebatch_gen-8_mbs-32_seed-22" \
     --tracin \
     --with_validation \
     --val_loss_type="rough-orig" \
     --eval_freq=50 \
     --eval_num_samples=256 \
     --eval_toxicity_model="s-nlp/roberta_toxicity_classifier" \
-    --gen_data_dir="gen_tox_grpo_samples_tracin_2.7b_fp16_kl-1.1_ep-2_rcap-4.1_samebatch_gen-8_mbs-32_seed-22"
+    --gen_data_dir="gen_tox_grpo_samples_tracin_2.7b_fp16_kl-1.1_ep-2_rcap-4.1_ensemble_samebatch_gen-8_mbs-32_seed-22"
