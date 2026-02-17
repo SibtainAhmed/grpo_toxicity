@@ -50,10 +50,12 @@ def load_eval_toxicity_model(model_name, device):
 
 def evaluate_toxicity_on_test_set(ppo_trainer, tokenizer, test_prompts, eval_classifier,
                                    device, num_samples=256, max_new_tokens=20, generation_kwargs=None):
-    """Evaluate model toxicity on held-out test set using a different toxicity detector."""
+    """Evaluate model toxicity on a FIXED held-out test set using a different toxicity detector.
+    NOTE: test_prompts should be PRE-SAMPLED once at startup and reused across all eval steps.
+    This eliminates sampling variance and makes eval/toxicity_mean stable and comparable."""
     num_eval = min(num_samples, len(test_prompts))
-    sample_indices = random.sample(range(len(test_prompts)), num_eval)
-    eval_prompts = [test_prompts[i] for i in sample_indices]
+    # Use ALL pre-sampled prompts (no re-sampling — fixed set for stable comparisons)
+    eval_prompts = test_prompts[:num_eval]
     if generation_kwargs is None:
         generation_kwargs = {
             "min_length": -1, "top_k": 0.0, "top_p": 1.0, "do_sample": True,
@@ -243,15 +245,21 @@ if hasattr(script_args, 'eval_freq') and script_args.eval_freq > 0:
             script_args.eval_toxicity_model,
             eval_device,
         )
-        # Use held-out test prompts from the dataset split
+        # PRE-SAMPLE a FIXED set of test prompts once at startup.
+        # The same prompts are reused for every evaluation step, eliminating
+        # sampling variance and making eval/toxicity_mean directly comparable
+        # across training steps.
         try:
-            test_prompts = val_question_tensors
-            print(f"  Test prompts for evaluation: {len(test_prompts)}")
+            _all_val = val_question_tensors
+            _num_eval = min(script_args.eval_num_samples, len(_all_val))
+            _fixed_indices = sorted(random.sample(range(len(_all_val)), _num_eval))
+            test_prompts = [_all_val[i] for i in _fixed_indices]
+            print(f"  FIXED eval prompts sampled at startup: {len(test_prompts)} / {len(_all_val)}")
+            print(f"  (Same prompts will be reused every eval step for stable graphs)")
         except NameError:
             print("  WARNING: val_question_tensors not defined, no test prompts for eval")
             test_prompts = None
         print(f"  Eval frequency: every {script_args.eval_freq} steps")
-        print(f"  Eval samples per round: {script_args.eval_num_samples}")
     except Exception as e:
         import traceback
         print(f"WARNING: Could not load eval toxicity model: {e}")

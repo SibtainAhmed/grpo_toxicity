@@ -859,22 +859,24 @@ def evaluate_toxicity_on_test_set(
     generation_kwargs=None,
 ):
     """
-    Evaluate the current model's toxicity on a held-out test set using
+    Evaluate the current model's toxicity on a FIXED held-out test set using
     a DIFFERENT toxicity detector than the training reward model.
     
     This gives an unbiased measure of whether toxicity is truly decreasing,
     not just that the model learned to game the specific reward model.
     
+    NOTE: test_prompts should be PRE-SAMPLED once at startup and reused
+    across all evaluation steps. This eliminates sampling variance and makes
+    the eval/toxicity_mean graph much more stable and comparable across steps.
+    
     Works with both PPO (AutoModelForCausalLMWithValueHead) and GRPO models.
     """
     import numpy as np
     
-    # Sample test prompts
+    # Use ALL pre-sampled test prompts (no re-sampling — fixed set for stable comparisons)
     num_available = len(test_prompts)
     num_eval = min(num_samples, num_available)
-    sample_indices = random.sample(range(num_available), num_eval)
-    
-    eval_prompts = [test_prompts[i] for i in sample_indices]
+    eval_prompts = test_prompts[:num_eval]
     
     if generation_kwargs is None:
         generation_kwargs = {

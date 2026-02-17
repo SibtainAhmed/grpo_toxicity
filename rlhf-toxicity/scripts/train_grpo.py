@@ -287,35 +287,34 @@ def evaluate_toxicity_on_test_set(
     generation_kwargs=None,
 ):
     """
-    Evaluate the current model's toxicity on a held-out test set using
+    Evaluate the current model's toxicity on a FIXED held-out test set using
     a DIFFERENT toxicity detector than the training reward model.
     
     This gives an unbiased measure of whether toxicity is truly decreasing,
     not just that the model learned to game the specific reward model.
     
+    NOTE: test_prompts should be PRE-SAMPLED once at startup and reused
+    across all evaluation steps. This eliminates sampling variance and makes
+    the eval/toxicity_mean graph much more stable and comparable across steps.
+    
     Args:
         model: The current policy model
         tokenizer: Tokenizer
-        test_prompts: List of test prompt tensors (from held-out split)
+        test_prompts: List of FIXED test prompt tensors (pre-sampled at startup)
         eval_classifier: Different toxicity classifier pipeline
         device: CUDA device
-        num_samples: Number of test prompts to evaluate
+        num_samples: Max number of prompts to evaluate (should match len(test_prompts))
         max_new_tokens: Max tokens to generate
         generation_kwargs: Generation parameters
         
     Returns:
         Dict of eval metrics
     """
-    import random
-    
     model.eval()
     
-    # Sample test prompts
-    num_available = len(test_prompts)
-    num_eval = min(num_samples, num_available)
-    sample_indices = random.sample(range(num_available), num_eval)
-    
-    eval_prompts = [test_prompts[i] for i in sample_indices]
+    # Use ALL pre-sampled test prompts (no re-sampling — fixed set for stable comparisons)
+    num_eval = min(num_samples, len(test_prompts))
+    eval_prompts = test_prompts[:num_eval]
     
     if generation_kwargs is None:
         generation_kwargs = {
@@ -1006,11 +1005,18 @@ if __name__ == "__main__":
                 script_args.eval_toxicity_model,
                 grpo_trainer.current_device,
             )
-            # Use held-out test prompts from the dataset split
-            test_prompts = val_question_tensors
-            print(f"  Test prompts for evaluation: {len(test_prompts)}")
+            # PRE-SAMPLE a FIXED set of test prompts once at startup.
+            # The same prompts are reused for every evaluation step, eliminating
+            # sampling variance and making eval/toxicity_mean directly comparable
+            # across training steps.
+            import random as _rng
+            _all_val = val_question_tensors
+            _num_eval = min(script_args.eval_num_samples, len(_all_val))
+            _fixed_indices = sorted(_rng.sample(range(len(_all_val)), _num_eval))
+            test_prompts = [_all_val[i] for i in _fixed_indices]
+            print(f"  FIXED eval prompts sampled at startup: {len(test_prompts)} / {len(_all_val)}")
+            print(f"  (Same prompts will be reused every eval step for stable graphs)")
             print(f"  Eval frequency: every {script_args.eval_freq} steps")
-            print(f"  Eval samples per round: {script_args.eval_num_samples}")
         except Exception as e:
             print(f"WARNING: Could not load eval toxicity model: {e}")
             print("  Continuing without periodic evaluation.")
