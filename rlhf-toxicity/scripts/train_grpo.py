@@ -614,10 +614,13 @@ def grpo_train_loop(
         # Get rewards
         t = time.time()
         scores = get_reward_scores(reward_model, reward_tokenizer, full_texts, device)
+        # Cap rewards to prevent reward over-optimization (Goodhart's Law)
+        REWARD_CAP = 4.1
+        scores = [min(s, REWARD_CAP) for s in scores]
         timing["time/grpo/reward"] = time.time() - t
         
         if epoch == 1:
-            print(f"\n=== Reward Scores ===")
+            print(f"\n=== Reward Scores (capped at {REWARD_CAP}) ===")
             print(f"Sample scores: {scores[:8]}")
             print(f"Mean: {mean(scores):.4f}, Std: {stdev(scores) if len(scores) > 1 else 0:.4f}")
             print("=" * 30)
@@ -801,6 +804,9 @@ def grpo_train_loop_with_validation(
         # Get rewards
         t = time.time()
         scores = get_reward_scores(reward_model, reward_tokenizer, full_texts, device)
+        # Cap rewards to prevent reward over-optimization (Goodhart's Law)
+        REWARD_CAP = 4.1
+        scores = [min(s, REWARD_CAP) for s in scores]
         timing["time/grpo/reward"] = time.time() - t
         
         # Run GRPO TracIn step (same-batch TracIn - no validation data needed!)
