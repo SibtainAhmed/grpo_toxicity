@@ -8,6 +8,7 @@
 # - mixed_precision fp16: 2x speedup on V100
 # - effective_batch = mini_batch_size * gradient_accumulation_steps * num_gpus
 
+export HF_TOKEN="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"
 set -x
 
 # Detect number of GPUs (uncomment for multi-GPU)

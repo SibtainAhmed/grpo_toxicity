@@ -21,6 +21,7 @@
 # - gen_bsize=128: Larger generation batch for better GPU utilization
 # - num_generations=8: SAME AS STANDARD for fair comparison
 
+export HF_TOKEN="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"
 set -x
 accelerate launch --main_process_port=29525 \
     --num_machines 1  \

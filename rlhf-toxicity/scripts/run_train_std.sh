@@ -1,3 +1,4 @@
+export HF_TOKEN="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"
 set -x
 accelerate launch --main_process_port=29522 \
     --num_machines 1  \
