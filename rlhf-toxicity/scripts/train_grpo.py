@@ -107,9 +107,14 @@ lora_config = LoraConfig(
 def get_reward_pipeline(rmname, device):
     """Load reward model and tokenizer."""
     if "hate" in rmname:
-        from transformers import RobertaTokenizer, RobertaForSequenceClassification
+        from transformers import RobertaForSequenceClassification
         toxicity_model_id = "facebook/roberta-hate-speech-dynabench-r4-target"
-        toxicity_tokenizer = RobertaTokenizer.from_pretrained(toxicity_model_id)
+        # This model doesn't ship its own tokenizer files; fall back to roberta-base
+        try:
+            toxicity_tokenizer = AutoTokenizer.from_pretrained(toxicity_model_id)
+        except OSError:
+            print(f"  Tokenizer not found for {toxicity_model_id}, falling back to roberta-base")
+            toxicity_tokenizer = AutoTokenizer.from_pretrained("roberta-base")
         toxicity_model = RobertaForSequenceClassification.from_pretrained(
             toxicity_model_id,
         ).to(device)
