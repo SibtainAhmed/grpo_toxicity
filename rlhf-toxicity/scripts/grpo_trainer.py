@@ -899,13 +899,20 @@ class GRPOTrainer:
 
     def compute_rewards_with_kl(self, scores, logprobs, ref_logprobs, masks):
         """
-        Compute rewards with KL penalty.
+        Compute rewards with KL penalty using the GRPO paper's KL divergence formula.
         
-        reward = score - kl_coef * kl
-        where kl = logprobs - ref_logprobs
+        DeepSeekMath eq (2):
+            D_KL(π_θ || π_ref) = π_ref/π_θ − log(π_ref/π_θ) − 1
+        
+        In log-space:  d = ref_logprobs − logprobs  (= log(π_ref/π_θ))
+                        kl = exp(d) − d − 1          (always ≥ 0)
+        
+        reward_t = −β * kl_t   (per-token penalty, always ≤ 0)
+        reward_T += score       (actual reward added at last token)
         """
-        kl = logprobs - ref_logprobs
-        non_score_reward = -self.kl_ctl.value * kl
+        d = ref_logprobs - logprobs                 # log(π_ref / π_θ)
+        kl = torch.exp(d) - d - 1.0                # paper eq (2), always >= 0
+        non_score_reward = -self.kl_ctl.value * kl  # always <= 0 (proper penalty)
         
         # Apply score only to last token
         rewards = non_score_reward.clone()
@@ -1025,6 +1032,7 @@ class GRPOTrainer:
                 
                 # Get mini-batch data (use cached tensors with consistent padding)
                 mb_logprobs_old = logprobs[batch_indices].detach()
+                mb_ref_logprobs = ref_logprobs[batch_indices].detach()
                 mb_advantages = advantages_expanded[batch_indices].detach()
                 mb_masks = masks[batch_indices]
                 mb_queries = [queries[i] for i in batch_indices]
@@ -1053,13 +1061,15 @@ class GRPOTrainer:
                     logits, mb_queries, mb_responses, max_response_len
                 )
                 
-                # Compute loss
+                # Compute loss (with differentiable KL term per GRPO paper eq 1-2)
                 pg_loss, stats = self.loss(
                     mb_logprobs_old,
                     response_logits,
                     mb_logprobs_new,
                     mb_masks,
                     mb_advantages,
+                    ref_logprobs=mb_ref_logprobs,
+                    kl_coef=self.kl_ctl.value,
                 )
                 
                 # Backward pass
@@ -1088,8 +1098,10 @@ class GRPOTrainer:
                 else:
                     stats[key] = np.mean(values)
         
-        # Update KL controller
-        kl = ((logprobs - ref_logprobs) * masks).sum(dim=-1).mean()
+        # Update KL controller using paper's KL formula (eq 2)
+        d = ref_logprobs - logprobs  # log(π_ref / π_θ)
+        per_token_kl = torch.exp(d) - d - 1.0  # paper eq (2), always >= 0
+        kl = (per_token_kl * masks).sum(dim=-1).mean()
         self.kl_ctl.update(kl.item(), bs)
         
         # Record step stats
@@ -1251,13 +1263,18 @@ class GRPOTrainer:
                 max_response_len
             )
             
-            # GRPO loss (same formulation as training)
+            # Get reference logprobs for this TracIn batch
+            mb_ref_logprobs = ref_logprobs[tracin_batch_inds].detach()
+            
+            # GRPO loss (same formulation as training, WITH differentiable KL)
             pg_loss, _ = self.loss(
                 tracin_batch_dict["logprobs"].detach(),
                 response_logits,
                 mb_logprobs_new,
                 tracin_batch_dict["masks"].detach(),
                 tracin_batch_dict["advantages_expanded"].detach(),
+                ref_logprobs=mb_ref_logprobs,
+                kl_coef=self.kl_ctl.value,
             )
             
             # Ghost backward (captures gradients gA, gB via hooks, no weight update)
@@ -1459,6 +1476,7 @@ class GRPOTrainer:
                         continue
                     
                     mb_logprobs_old = batch_dict["logprobs"][mini_batch_inds].detach()
+                    mb_ref_logprobs = ref_logprobs[mini_batch_inds].detach()
                     mb_advantages = batch_dict["advantages_expanded"][mini_batch_inds].detach()
                     mb_masks = batch_dict["masks"][mini_batch_inds]
                     mb_queries = [batch_dict["queries"][i] for i in mini_batch_inds]
@@ -1483,12 +1501,15 @@ class GRPOTrainer:
                         logits, mb_queries, mb_responses, max_response_len
                     )
                     
+                    # Loss with differentiable KL (GRPO paper eq 1-2)
                     pg_loss, stats = self.loss(
                         mb_logprobs_old,
                         response_logits,
                         mb_logprobs_new,
                         mb_masks,
                         mb_advantages,
+                        ref_logprobs=mb_ref_logprobs,
+                        kl_coef=self.kl_ctl.value,
                     )
                     
                     # Backward + step (same as step() — no accumulation wrapper)
@@ -1530,8 +1551,10 @@ class GRPOTrainer:
                 if len(values) > 0:
                     stats[key] = np.mean(values)
         
-        # Update KL controller
-        kl = ((logprobs.detach() - ref_logprobs) * masks).sum(dim=-1).mean()
+        # Update KL controller using paper's KL formula (eq 2)
+        d_tracin = ref_logprobs - logprobs.detach()  # log(π_ref / π_θ)
+        per_token_kl_tracin = torch.exp(d_tracin) - d_tracin - 1.0  # always >= 0
+        kl = (per_token_kl_tracin * masks).sum(dim=-1).mean()
         self.kl_ctl.update(kl.item(), bs)
         
         # Record step stats
@@ -1591,18 +1614,32 @@ class GRPOTrainer:
         logprobs: torch.FloatTensor,
         mask: torch.LongTensor,
         advantages: torch.FloatTensor,
+        ref_logprobs: torch.FloatTensor = None,
+        kl_coef: float = 0.0,
         entropy_coef: float = 0.01,
     ):
         """
-        Calculate GRPO policy loss (no value loss).
+        Calculate GRPO policy loss with KL divergence (DeepSeekMath paper, eq 1-2).
+        
+        L = clipped_pg_loss + β * D_KL(π_θ || π_ref) − entropy_coef * entropy
+        
+        where D_KL uses the paper's formula (eq 2):
+            D_KL = π_ref/π_θ − log(π_ref/π_θ) − 1
+                 = exp(ref_logprobs − logprobs) − (ref_logprobs − logprobs) − 1
+        
+        This KL term IS differentiated (gradient flows through logprobs), which
+        directly penalises the model for drifting from the reference policy.
         
         Args:
-            old_logprobs: Log probabilities from old policy
-            logits: Logits from current policy
-            logprobs: Log probabilities from current policy
+            old_logprobs: Log probabilities from old policy (detached)
+            logits: Logits from current policy (for entropy)
+            logprobs: Log probabilities from current policy (has grad)
             mask: Attention mask
-            advantages: Group-relative advantages
-            entropy_coef: Coefficient for entropy bonus (encourages exploration)
+            advantages: Group-relative advantages (detached)
+            ref_logprobs: Log probabilities from frozen reference model (detached).
+                          If None, KL loss term is skipped.
+            kl_coef: β coefficient for KL penalty (from adaptive controller)
+            entropy_coef: Coefficient for entropy bonus
         """
         # Policy gradient with clipping
         ratio = torch.exp(logprobs - old_logprobs)
@@ -1628,20 +1665,37 @@ class GRPOTrainer:
         # Entropy bonus - encourages exploration and reduces variance
         entropy = masked_mean(entropy_from_logits(logits), mask)
         
-        # Total loss = policy loss - entropy bonus (we want to maximize entropy)
-        total_loss = pg_loss - entropy_coef * entropy
+        # KL divergence loss (DeepSeekMath paper eq 2) — DIFFERENTIABLE w.r.t. logprobs
+        # D_KL = exp(d) − d − 1,  where d = ref_logprobs − logprobs = log(π_ref/π_θ)
+        # Gradient: ∂D_KL/∂logprobs = −exp(d) + 1 = 1 − π_ref/π_θ
+        #   → pushes logprobs towards ref_logprobs (regularisation)
+        if ref_logprobs is not None and kl_coef > 0:
+            d = ref_logprobs.detach() - logprobs         # log(π_ref / π_θ), has grad via logprobs
+            per_token_kl = torch.exp(d) - d - 1.0        # eq (2), always >= 0
+            kl_loss = kl_coef * masked_mean(per_token_kl, mask)
+        else:
+            per_token_kl = torch.zeros_like(logprobs)
+            kl_loss = torch.tensor(0.0, device=logprobs.device)
         
-        # Approximate KL
+        # Total loss = policy_loss + β * D_KL − entropy_bonus   (eq 1, negated for minimisation)
+        total_loss = pg_loss + kl_loss - entropy_coef * entropy
+        
+        # Approximate KL between current and old policy (for logging only, not in loss)
         approxkl = 0.5 * masked_mean((logprobs - old_logprobs) ** 2, mask)
         policykl = masked_mean(old_logprobs - logprobs, mask)
         
+        # Mean KL vs reference (for logging)
+        mean_ref_kl = masked_mean(per_token_kl, mask).detach()
+        
         stats = {
             "loss/policy": pg_loss.detach(),
+            "loss/kl": kl_loss.detach(),
             "loss/entropy": (-entropy_coef * entropy).detach(),
             "loss/total": total_loss.detach(),
             "policy/entropy": entropy.detach(),
             "policy/approxkl": approxkl.detach(),
             "policy/policykl": policykl.detach(),
+            "policy/ref_kl": mean_ref_kl,
             "policy/clipfrac": pg_clipfrac.detach(),
             "policy/advantages_mean": masked_mean(advantages, mask).detach(),
             "policy/advantages_std": masked_var(advantages, mask).sqrt().detach(),
@@ -1659,7 +1713,10 @@ class GRPOTrainer:
         ref_logprobs = data.get("ref_logprobs")
         
         if ref_logprobs is not None and masks is not None:
-            kl_list = ((logprobs - ref_logprobs) * masks).sum(dim=-1)
+            # Use paper's KL formula (eq 2): exp(d) - d - 1 where d = log(π_ref/π_θ)
+            d = ref_logprobs - logprobs  # log(π_ref / π_θ)
+            per_token_kl = torch.exp(d) - d - 1.0  # always >= 0
+            kl_list = (per_token_kl * masks).sum(dim=-1)
             mean_kl = kl_list.mean()
             stats["objective/kl"] = mean_kl
         
