@@ -1616,32 +1616,18 @@ class GRPOTrainer:
         advantages: torch.FloatTensor,
         ref_logprobs: torch.FloatTensor = None,
         kl_coef: float = 0.0,
-        entropy_coef: float = 0.01,
     ):
         """
-        Calculate GRPO policy loss with KL divergence (DeepSeekMath paper, eq 1-2).
+        GRPO loss (DeepSeekMath paper, eq 1-2). Negated for minimisation:
         
-        L = clipped_pg_loss + β * D_KL(π_θ || π_ref) − entropy_coef * entropy
+        L = −(1/G) Σ min(ratio·Aᵢ, clip(ratio)·Aᵢ)  +  β · D_KL(π_θ ‖ π_ref)
         
-        where D_KL uses the paper's formula (eq 2):
+        D_KL uses the paper's unbiased estimator (eq 2):
             D_KL = π_ref/π_θ − log(π_ref/π_θ) − 1
-                 = exp(ref_logprobs − logprobs) − (ref_logprobs − logprobs) − 1
         
-        This KL term IS differentiated (gradient flows through logprobs), which
-        directly penalises the model for drifting from the reference policy.
-        
-        Args:
-            old_logprobs: Log probabilities from old policy (detached)
-            logits: Logits from current policy (for entropy)
-            logprobs: Log probabilities from current policy (has grad)
-            mask: Attention mask
-            advantages: Group-relative advantages (detached)
-            ref_logprobs: Log probabilities from frozen reference model (detached).
-                          If None, KL loss term is skipped.
-            kl_coef: β coefficient for KL penalty (from adaptive controller)
-            entropy_coef: Coefficient for entropy bonus
+        The KL term IS differentiated (gradient flows through logprobs).
+        No entropy bonus — not in the paper.
         """
-        # Policy gradient with clipping
         ratio = torch.exp(logprobs - old_logprobs)
         
         pg_losses = -advantages * ratio
@@ -1654,7 +1640,6 @@ class GRPOTrainer:
         pg_loss = masked_mean(torch.max(pg_losses, pg_losses2), mask)
         pg_clipfrac = masked_mean(torch.gt(pg_losses2, pg_losses).float(), mask)
         
-        # Check for high ratio
         avg_ratio = masked_mean(ratio, mask).item()
         if avg_ratio > self.config.ratio_threshold:
             warnings.warn(
@@ -1662,35 +1647,26 @@ class GRPOTrainer:
             )
             pg_loss = pg_loss * 0.0
         
-        # Entropy bonus - encourages exploration and reduces variance
-        entropy = masked_mean(entropy_from_logits(logits), mask)
-        
-        # KL divergence loss (DeepSeekMath paper eq 2) — DIFFERENTIABLE w.r.t. logprobs
-        # D_KL = exp(d) − d − 1,  where d = ref_logprobs − logprobs = log(π_ref/π_θ)
-        # Gradient: ∂D_KL/∂logprobs = −exp(d) + 1 = 1 − π_ref/π_θ
-        #   → pushes logprobs towards ref_logprobs (regularisation)
+        # D_KL (eq 2) — differentiable w.r.t. logprobs
         if ref_logprobs is not None and kl_coef > 0:
-            d = ref_logprobs.detach() - logprobs         # log(π_ref / π_θ), has grad via logprobs
-            per_token_kl = torch.exp(d) - d - 1.0        # eq (2), always >= 0
+            d = ref_logprobs.detach() - logprobs
+            per_token_kl = torch.exp(d) - d - 1.0
             kl_loss = kl_coef * masked_mean(per_token_kl, mask)
         else:
             per_token_kl = torch.zeros_like(logprobs)
             kl_loss = torch.tensor(0.0, device=logprobs.device)
         
-        # Total loss = policy_loss + β * D_KL − entropy_bonus   (eq 1, negated for minimisation)
-        total_loss = pg_loss + kl_loss - entropy_coef * entropy
+        total_loss = pg_loss + kl_loss
         
-        # Approximate KL between current and old policy (for logging only, not in loss)
+        # Logging-only quantities
+        entropy = masked_mean(entropy_from_logits(logits), mask)
         approxkl = 0.5 * masked_mean((logprobs - old_logprobs) ** 2, mask)
         policykl = masked_mean(old_logprobs - logprobs, mask)
-        
-        # Mean KL vs reference (for logging)
         mean_ref_kl = masked_mean(per_token_kl, mask).detach()
         
         stats = {
             "loss/policy": pg_loss.detach(),
             "loss/kl": kl_loss.detach(),
-            "loss/entropy": (-entropy_coef * entropy).detach(),
             "loss/total": total_loss.detach(),
             "policy/entropy": entropy.detach(),
             "policy/approxkl": approxkl.detach(),
