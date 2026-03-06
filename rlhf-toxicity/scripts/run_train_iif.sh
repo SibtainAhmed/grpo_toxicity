@@ -1,5 +1,8 @@
 set -x
-export HF_TOKEN="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"
+if [ -z "$HF_TOKEN" ]; then
+    echo "ERROR: HF_TOKEN not set. Run: export HF_TOKEN=your_token (or add to ~/.bashrc)"
+    exit 1
+fi
 accelerate launch --main_process_port=29524 \
     --num_machines 1  \
     --num_processes 1 \

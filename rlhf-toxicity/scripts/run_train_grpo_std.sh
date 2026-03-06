@@ -8,7 +8,10 @@
 # - mixed_precision fp16: 2x speedup on V100
 # - effective_batch = mini_batch_size * gradient_accumulation_steps * num_gpus
 
-export HF_TOKEN="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"
+if [ -z "$HF_TOKEN" ]; then
+    echo "ERROR: HF_TOKEN not set. Run: export HF_TOKEN=your_token (or add to ~/.bashrc)"
+    exit 1
+fi
 set -x
 
 # Detect number of GPUs (uncomment for multi-GPU)
